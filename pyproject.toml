@@ -1,0 +1,9 @@
+[project]
+name = "a2claude"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "a2a-sdk[fastapi,http-server]>=1.1.2",
+    "claude-agent-sdk>=0.2.144",
+    "uvicorn>=0.52.4",
+]

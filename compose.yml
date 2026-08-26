@@ -1,0 +1,33 @@
+services:
+  a2claude-api:
+    build: .
+    image: a2claude:latest
+    container_name: a2claude-api
+    restart: unless-stopped
+    networks: [a2claude-net]
+    environment:
+      A2A_TOKEN: ${A2A_TOKEN:?set A2A_TOKEN in .env}
+      PUBLIC_URL: ${PUBLIC_URL:?set PUBLIC_URL in .env}
+      WORKSPACE: /home/agent/workspace
+    volumes:
+      # Claude Code writes its OAuth credentials here. Survives restarts and rebuilds,
+      # so the one-time `claude` login is genuinely one-time.
+      - claude-auth:/home/agent/.claude
+      # Container-owned workspace, not a Mac bind mount. Persists across rebuilds.
+      - workspace:/home/agent/workspace
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: a2claude-tunnel
+    restart: unless-stopped
+    networks: [a2claude-net]
+    command: tunnel --no-autoupdate run --token ${TUNNEL_TOKEN:?set TUNNEL_TOKEN in .env}
+    depends_on: [a2claude-api]
+
+volumes:
+  claude-auth:
+  workspace:
+
+networks:
+  a2claude-net:
+    name: a2claude-net
