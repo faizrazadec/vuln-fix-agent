@@ -12,6 +12,8 @@ from fastapi.testclient import TestClient
 import os
 os.environ.setdefault("A2A_TOKEN", "test-token")
 
+import sys as _sys, pathlib as _pl
+_sys.path.insert(0, str(_pl.Path(__file__).resolve().parent.parent / "app"))
 from main import PUBLIC_URL, app
 
 client = TestClient(app)

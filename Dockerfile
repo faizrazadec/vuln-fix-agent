@@ -30,11 +30,11 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
-COPY main.py entrypoint.sh ./
+COPY app/main.py app/entrypoint.sh ./
 # Glob so a fresh clone (example only) still builds; real projects.json is gitignored.
-COPY projects*.json ./
-COPY bin/ /app/bin/
-COPY skills/ /app/skills/
+COPY app/projects*.json ./
+COPY app/bin/ /app/bin/
+COPY app/skills/ /app/skills/
 
 # Claude Code refuses --dangerously-skip-permissions (what permission_mode=
 # "bypassPermissions" sends) under root, so the server runs unprivileged.

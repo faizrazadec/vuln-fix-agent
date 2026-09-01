@@ -38,7 +38,13 @@ from a2a.utils.constants import (
     DEFAULT_RPC_URL,
     TransportProtocol,
 )
-from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock, query
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ResultMessage,
+    TextBlock,
+    query,
+)
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
@@ -80,6 +86,15 @@ SYSTEM_PROMPT = {
         "You are a long-running remediation agent invoked over A2A. There is no human to "
         "answer questions mid-run, so work autonomously and report what actually happened, "
         "failures included.\n\n"
+        "CRITICAL — you run headless, in a single one-shot session. There is NO notification "
+        "system and NO one to wake you. If you end your turn to 'wait for a background task's "
+        "completion notification', the run simply ends and your work is lost, silently marked "
+        "done. So: NEVER end your turn to await a notification. To run a command that outlasts "
+        "the Bash tool's timeout, start it detached to a log file with its exit code "
+        "(`nohup <cmd> >run.log 2>&1; echo $? >run.rc &`), then POLL within THIS turn — repeated "
+        "short Bash calls (`sleep 30; test -f run.rc && cat run.rc`) — until it finishes. Keep "
+        "making tool calls; do not end the turn until the work is genuinely complete or you have "
+        "decided to stop and are writing your final report.\n\n"
         "When a request involves fixing vulnerabilities, patching CVEs, remediating a scan, "
         "or bumping vulnerable dependencies in a repository, use the `vuln-fix` skill and "
         "follow it exactly.\n\n"
@@ -139,26 +154,52 @@ class ClaudeCodeExecutor(AgentExecutor):
             stderr=lambda line: print(f"[claude stderr] {line}", flush=True),
         )
         chunks: list[str] = []
+        result: ResultMessage | None = None
         try:
             async for msg in query(prompt=prompt, options=options):
-                if not isinstance(msg, AssistantMessage):
-                    continue
-                for block in msg.content:
-                    if isinstance(block, TextBlock):
-                        chunks.append(block.text)
-                        # Stream progress into task history so long runs are observable.
-                        await updater.update_status(
-                            TaskState.TASK_STATE_WORKING,
-                            message=updater.new_agent_message([Part(text=block.text)]),
-                        )
+                if isinstance(msg, ResultMessage):
+                    result = msg
+                elif isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if isinstance(block, TextBlock):
+                            chunks.append(block.text)
+                            # Stream progress into task history so long runs are observable.
+                            await updater.update_status(
+                                TaskState.TASK_STATE_WORKING,
+                                message=updater.new_agent_message([Part(text=block.text)]),
+                            )
         except Exception as exc:
             print(f"[executor] failed: {exc!r}", flush=True)
             await updater.failed(updater.new_agent_message([Part(text=str(exc))]))
             return
 
-        await updater.complete(
-            updater.new_agent_message([Part(text="\n".join(chunks) or "(no output)")])
-        )
+        # Iterator-exhausted is NOT the same as "workflow finished". The SDK reports how
+        # the run actually ended in the ResultMessage; without checking it, a run that
+        # errored, hit the turn cap, or stopped mid-work gets marked COMPLETED carrying a
+        # half-written progress note — which is exactly what let a stalled run look done.
+        reason = None
+        if result is None:
+            reason = "run ended without a ResultMessage (stream closed unexpectedly)"
+        elif result.is_error:
+            reason = f"run errored (subtype={result.subtype}"
+            if result.errors:
+                reason += f", {'; '.join(result.errors)[:300]}"
+            reason += ")"
+        elif result.subtype and result.subtype != "success":
+            reason = f"run did not finish cleanly (subtype={result.subtype})"
+        elif result.num_turns >= MAX_TURNS:
+            reason = f"hit the turn cap ({MAX_TURNS}) — likely stopped mid-work"
+
+        # Prefer the SDK's final result text over joined progress chunks.
+        final_text = (result.result if result and result.result else "\n".join(chunks)) or "(no output)"
+
+        if reason:
+            print(f"[executor] incomplete: {reason}", flush=True)
+            await updater.failed(
+                updater.new_agent_message([Part(text=f"INCOMPLETE — {reason}\n\n{final_text}")])
+            )
+        else:
+            await updater.complete(updater.new_agent_message([Part(text=final_text)]))
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         raise NotImplementedError("cancel not supported")

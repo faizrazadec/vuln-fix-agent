@@ -19,6 +19,8 @@ from a2a.types import Part, TaskState  # noqa: E402
 import httpx  # noqa: E402
 import uvicorn  # noqa: E402
 
+import sys as _sys, pathlib as _pl
+_sys.path.insert(0, str(_pl.Path(__file__).resolve().parent.parent / "app"))
 import main  # noqa: E402
 
 AUTH = {"A2A-Version": "1.0", "Authorization": "Bearer test-token"}

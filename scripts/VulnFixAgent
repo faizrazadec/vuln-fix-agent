@@ -8,7 +8,8 @@
 # running them concurrently would hammer Claude usage, CPU and Docker at once.
 set -u
 
-DIR="$(cd "$(dirname "$0")" && pwd)"
+# Operate from the repo root (scripts/ is one level down).
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$DIR"
 
 LOCK="/tmp/a2claude-run-all.lock"
@@ -34,16 +35,16 @@ if ! curl -sf -m 10 -o /dev/null "$CARD"; then
 fi
 
 # --- projects, in registry order ------------------------------------------------
-PROJECTS=$(python3 -c 'import json;print(*json.load(open("projects.json")))' 2>/dev/null)
+PROJECTS=$(python3 -c 'import json;print(*json.load(open("app/projects.json")))' 2>/dev/null)
 if [ -z "$PROJECTS" ]; then
-  echo "$(LOG_TS) no projects in projects.json — nothing to do"; exit 0
+  echo "$(LOG_TS) no projects in app/projects.json — nothing to do"; exit 0
 fi
 
 echo "$(LOG_TS) === run-all start: $PROJECTS ==="
 for proj in $PROJECTS; do
   start=$(date +%s)
   echo "$(LOG_TS) --- $proj: starting ---"
-  ./ask.sh "fix vulns in $proj"       # blocks until this project's task completes
+  scripts/ask.sh "fix vulns in $proj"       # blocks until this project's task completes
   echo "$(LOG_TS) --- $proj: done in $(( $(date +%s) - start ))s ---"
 done
 echo "$(LOG_TS) === run-all finished ==="

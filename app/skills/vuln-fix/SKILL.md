@@ -16,6 +16,18 @@ deactivate a finding in Vanta, or investigate a broken fix). Keep every message 
 errors, fall back to the `slack-notify "..."` CLI; if that also fails, say in your final
 report that the notification could not be delivered — never assume it was sent.
 
+**Resource discipline — applies to every test run and image build below.** This runs on a
+memory-constrained VM shared with other work; unbounded parallelism has OOM-killed test
+runs before (processes vanish with no summary). So:
+- **Cap parallelism** on every test/build command. Pass the tool's concurrency flag rather
+  than letting it fan out across all cores: `turbo run … --concurrency=2`,
+  `vitest --maxWorkers=2`, `jest --maxWorkers=50%`, `pytest -n 2` (if xdist),
+  `NODE_OPTIONS=--max-old-space-size=2048` for a Node build that balloons. Prefer a slower,
+  flat run over a fast spike that gets killed.
+- **Never build with `--no-cache`.** Rely on Docker's layer cache so a rebuild only
+  re-installs the dependency you changed, not the whole tree — the install/build otherwise
+  runs twice (host tests, then `docker build`). Do not bust the cache unnecessarily.
+
 ## Steps
 
 1. **Get the finding list.** `vanta-findings <project> --json`. This is the authoritative
@@ -60,11 +72,20 @@ report that the notification could not be delivered — never assume it was sent
 
 5. **Baseline both, before changing anything.** Record whether each already passes:
    - **Code:** the repo's test suite (discover the command from `package.json`,
-     `Makefile`, `pyproject.toml`, `go.mod`, or `.github/workflows/`).
-   - **Image:** if the repo has a Dockerfile, `docker build`. If the daemon is
+     `Makefile`, `pyproject.toml`, `go.mod`, or `.github/workflows/`), with parallelism
+     capped per the resource-discipline note above.
+   - **Image:** if the repo has a Dockerfile, `docker build` (with cache). If the daemon is
      unreachable, say so and continue — do not fake an image result.
    A pre-existing failure is not yours to fix, but you must know it was red before you
    started so you can tell your breakage from theirs.
+
+   **Time-box it, and never hang.** If the suite outlasts the Bash tool timeout, run it
+   detached to a log file and poll within the turn (see the headless rule in your system
+   prompt) — never end the turn waiting for it. If it still has not finished after ~15
+   minutes, stop waiting: record "baseline incomplete — suite exceeds time budget" and
+   proceed. A patch- or minor-level bump inside the package's existing semver range is low
+   risk; note the incomplete baseline in the PR body rather than sinking the whole run into
+   baselining. The baseline exists to protect the fix, not to outlast it.
 
 6. **Work through the surviving findings one at a time.** For each:
 
@@ -84,9 +105,21 @@ report that the notification could not be delivered — never assume it was sent
 7. **After applying fixes, verify BOTH — always, even for an image-only finding:**
    - **Code:** run the test suite in the FOREGROUND and wait for the exit code. Never
      background it and assume success.
-   - **Image:** rebuild the Docker image, then `trivy image --severity CRITICAL,HIGH,MEDIUM,LOW <tag>`
-     and confirm the CVEs you fixed are gone from the rebuilt image.
-   Both must end at least as green as the baseline.
+   - **Image:** rebuild the Docker image (with cache — never `--no-cache`), then
+     `trivy image --severity CRITICAL,HIGH,MEDIUM,LOW <tag>` and confirm the CVEs you fixed
+     are gone from the rebuilt image.
+   Both must end at least as green as the baseline. Cap parallelism on both per the
+   resource-discipline note above.
+
+   **Net-regression check.** A bump can clear its target CVE yet introduce NEW findings of
+   equal or higher severity — e.g. `pip 26.2.1` clears its CVEs but vendors a newer
+   `setuptools`/`msgpack` that Trivy flags as HIGH. Compare the rebuilt image's findings to
+   the baseline: if a bump adds findings ≥ the severity it removed, it is a **net
+   regression** — revert that specific bump and treat that finding as having **no safe fix**
+   (notify like an unfixable finding, 6a wording adapted: "<package> <CVE>: the only
+   available fix (<version>) introduces new <severity> findings via <vendored/transitive
+   dep> — a net regression, not applied. Please deactivate it in Vanta or review manually."
+   then `vuln-ledger <project> add-notified <CVE>`). Keep the clean bumps.
 
 8. **Decide, per the verification result:**
 
@@ -127,3 +160,12 @@ report that the notification could not be delivered — never assume it was sent
   NOT rewrite history to "fix" it.
 - Report tests and scans as they actually ran. If you skipped a step, say you skipped it.
   A partial result with an honest description beats an invented success.
+- **Never describe PR contents before a PR exists.** Do not say a fix is "in" or "not in
+  the PR" until you have actually run `gh pr create` and have a real PR URL. A finding you
+  could not fix (unfixable, or a net regression per step 7) is reported as an action item —
+  "deactivate in Vanta / review manually" — never as a claim about a PR. Reference a PR only
+  by the real URL `gh pr create` returned; if you opened none, say "no PR opened," not
+  "not in the PR."
+- Distinguish "fixed and MERGED in <base>" (truly done, only the image rebuild is pending)
+  from "in an open PR" (proposed, NOT landed) from "not fixed." Never present an open or
+  unmerged PR's changes as already done.

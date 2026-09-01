@@ -4,6 +4,8 @@ import os
 
 os.environ.setdefault("A2A_TOKEN", "test-token")
 
+import sys as _sys, pathlib as _pl
+_sys.path.insert(0, str(_pl.Path(__file__).resolve().parent.parent / "app"))
 from main import _disallowed_urls  # noqa: E402
 
 OK = "git@github.com:Ember-AI-Engineering/snapdev-backend.git"

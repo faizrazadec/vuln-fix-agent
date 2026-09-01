@@ -8,7 +8,8 @@
 # Sends returnImmediately so the run survives any HTTP timeout, then polls GetTask
 # until it finishes. Prints progress as the agent works.
 set -e
-cd "$(dirname "$0")"
+# scripts/ live one level below the repo root; operate from the root.
+cd "$(dirname "$0")/.."
 . ./.env
 
 URL="${A2A_URL:-http://127.0.0.1:9999/}"

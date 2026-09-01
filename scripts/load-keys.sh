@@ -3,7 +3,7 @@
 # Re-run after rotating a key. Key material is streamed through the docker daemon;
 # nothing is printed and nothing is written into this directory.
 set -e
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 . ./.env
 
 : "${SSH_KEY_DIR:?set SSH_KEY_DIR in .env}"

@@ -12,14 +12,27 @@ Billing runs through an interactive **Claude subscription login**, not `ANTHROPI
 The `claude` CLI must be logged in once inside the container; credentials persist in the
 `claude-auth` volume. If that volume is wiped, the server cannot run until you log in again.
 
+## Layout
+
+```
+app/       what runs inside the container: main.py, entrypoint.sh, bin/ (agent
+           CLI tools: vanta-findings, slack-notify, vuln-ledger), skills/vuln-fix,
+           and projects.json (the registry — gitignored; projects.example.json is the template)
+scripts/   host-side ops: ask.sh (fire one run), VulnFixAgent (the scheduled batch runner),
+           load-keys.sh (load SSH keys into the volume)
+deploy/    the launchd plist for the weekday schedule
+tests/     assert-based scripts (add app/ to sys.path, then import main)
+Dockerfile, compose.yml, pyproject.toml, uv.lock, .env  — at the root
+```
+
 ## Commands
 
 ```bash
 uv sync                                # install deps (Python >=3.14)
 
-uv run python test_protocol.py         # protocol tests — offline, free, stubs the executor
-uv run python test_smoke.py            # end-to-end — spawns real Claude Code, BURNS QUOTA
-uv run python test_smoke.py --card-only  # agent-card assertions only, no quota
+uv run python tests/test_protocol.py         # protocol tests — offline, free, stubs the executor
+uv run python tests/test_smoke.py            # end-to-end — spawns real Claude Code, BURNS QUOTA
+uv run python tests/test_smoke.py --card-only  # agent-card assertions only, no quota
 
 docker compose up -d --build
 docker compose logs -f a2claude-api
@@ -27,13 +40,13 @@ docker compose exec -it a2claude-api claude   # the one-time interactive login
 ```
 
 Tests are plain scripts with `assert` and an `__main__` block — no pytest, no fixtures.
-To run one case, import it: `uv run python -c "import test_protocol as t; t.test_auth()"`.
-Importing `test_protocol` has side effects by design — it stubs `ClaudeCodeExecutor.execute`
-and starts a real uvicorn server on port 8931 at module level.
+Each test file adds `app/` to `sys.path`, then imports `main`. Importing `test_protocol` has
+side effects by design — it stubs `ClaudeCodeExecutor.execute` and starts a real uvicorn
+server on port 8931 at module level.
 
 ## Architecture
 
-**`main.py`** is the whole server. `ClaudeCodeExecutor` implements the a2a-sdk
+**`app/main.py`** is the whole server. `ClaudeCodeExecutor` implements the a2a-sdk
 `AgentExecutor` interface and bridges A2A's task lifecycle to `claude_agent_sdk.query()`.
 
 Three decisions there are load-bearing and easy to break:
@@ -49,12 +62,12 @@ Three decisions there are load-bearing and easy to break:
 - **Auth middleware.** Everything is bearer-gated except the agent card, which stays public
   so callers can discover the endpoint. Comparison uses `secrets.compare_digest`.
 
-**`workflow.md`** is loaded as the system prompt if present. It is the vulnerability-fix
-pipeline expressed as *instructions*, not orchestration code — Claude Code already has the
-agent loop. If the file is absent the server degrades to a plain coding agent, which is why
-the load is guarded rather than required.
+**`app/skills/vuln-fix/SKILL.md`** is the vulnerability-fix pipeline expressed as
+*instructions*, not orchestration code — Claude Code already has the agent loop. It is
+installed as a skill (`skills=["vuln-fix"]`) and the system prompt only points at it; the
+prompt is appended to Claude Code's own via `preset` + `append`, never replacing it.
 
-**`entrypoint.sh`** builds git/SSH identity at container start, before exec'ing the server.
+**`app/entrypoint.sh`** builds git/SSH identity at container start, before exec'ing the server.
 Keys are bind-mounted read-only at `/ssh-keys` and **copied** to `~/.ssh` — ssh rejects keys
 carrying the host's uid and permissions. Commits are SSH-signed; the signing key must be
 registered on GitHub *twice*, as an Auth key and separately as a Signing key, or the Verified
