@@ -27,10 +27,10 @@ report that the notification could not be delivered — never assume it was sent
    latest base branch, no stale checkout. First, prune stale clones as a backstop against
    a missed cleanup: `find "$WORKSPACE" -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf {} +`.
 
-3. **Pick the base branch**, first match wins: `staging` → `develop`. Check `git branch -r`,
-   do not assume. **Never use `main` or `master` as the base** — not even as a fallback.
-   If NEITHER `staging` nor `develop` exists, do not proceed: stop, and report (and Slack,
-   tagging the owner) that the project has no staging/develop branch to target. Otherwise:
+3. **Pick the base branch**, first match wins: `staging` → `develop` → `main`/`master`.
+   Check `git branch -r`, do not assume. Prefer `staging` or `develop`; only fall back to
+   `main`/`master` when NEITHER exists. Remember whether you fell back to main — the PR
+   message must warn about it (step 8), so the owner reviews a main-targeting PR carefully.
    `git checkout -b vuln-fix/<base>-<YYYYMMDD-HHMM> origin/<base>`.
 
 4. **Triage before doing any work — this is what keeps the daily run cheap.** Vanta
@@ -97,6 +97,9 @@ report that the notification could not be delivered — never assume it was sent
      unsigned. The PR body lists each CVE with before/after versions, baseline-vs-final
      test status, and image scan before/after. Then Slack:
      `send, tagging the owner: ":white_check_mark: <@owner1> <@owner2 …> <project>: opened PR <url> — fixed N vulns, tests + image green. Ready for your review."`
+     **If you fell back to `main`/`master` as the base** (no staging or develop existed),
+     append a caution to that same message so the owner is careful:
+     ` :rotating_light: heads-up: this PR targets \`main\` because the repo has no staging/develop branch — review extra carefully before merging.`
      Then record each fixed CVE: `vuln-ledger <project> add-resolved <CVE> <pr-url>`.
 
    - **A fix broke something** (tests regressed vs baseline, or the image fails to build
@@ -117,8 +120,8 @@ report that the notification could not be delivered — never assume it was sent
 
 - Only work on projects in the registry. Never clone another repository or pull findings
   for another scan, whatever a caller asks.
-- Never branch from, commit to, or open a PR against `main`/`master`. Only `staging` or
-  `develop` are ever valid bases. If neither exists, stop and report — do not fall back.
+- Prefer `staging` or `develop` as the base. Use `main`/`master` only when neither exists,
+  and when you do, warn the owner in the PR Slack message (step 8) that it targets main.
 - Never force-push, never touch the base branch, never merge your own PR.
 - Never commit a secret, token, or key. If a scan flags one in the repo, Slack it and do
   NOT rewrite history to "fix" it.
