@@ -129,6 +129,10 @@ class ClaudeCodeExecutor(AgentExecutor):
         await updater.start_work()
 
         prompt = context.get_user_input()
+        # Server-side log line, captured by `docker logs`, so the run has a durable record
+        # even if the client-side poller dies mid-run (a dead poller silently freezes its
+        # own log while the task keeps running here).
+        print(f"[task {context.task_id}] START: {prompt[:120]}", flush=True)
         rogue = _disallowed_urls(prompt)
         if rogue:
             await updater.failed(
@@ -194,11 +198,12 @@ class ClaudeCodeExecutor(AgentExecutor):
         final_text = (result.result if result and result.result else "\n".join(chunks)) or "(no output)"
 
         if reason:
-            print(f"[executor] incomplete: {reason}", flush=True)
+            print(f"[task {context.task_id}] FAILED: {reason}", flush=True)
             await updater.failed(
                 updater.new_agent_message([Part(text=f"INCOMPLETE — {reason}\n\n{final_text}")])
             )
         else:
+            print(f"[task {context.task_id}] COMPLETED", flush=True)
             await updater.complete(updater.new_agent_message([Part(text=final_text)]))
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:

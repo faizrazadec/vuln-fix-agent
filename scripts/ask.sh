@@ -41,13 +41,16 @@ print(d["result"]["task"]["id"])')
 
 echo "task $TASK — polling (ctrl-c is safe, the run continues)"
 SEEN=0
+FAILS=0
 while :; do
   sleep 10
+  # A transient curl/parse blip must NOT kill the poll — the task keeps running in the
+  # container regardless. Retry; give up only after many consecutive failures.
   GOT=$(curl -sS -X POST "$URL" -H "Content-Type: application/json" \
     -H "A2A-Version: 1.0" -H "Authorization: Bearer $A2A_TOKEN" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":\"2\",\"method\":\"GetTask\",\"params\":{\"id\":\"$TASK\"}}")
+    -d "{\"jsonrpc\":\"2.0\",\"id\":\"2\",\"method\":\"GetTask\",\"params\":{\"id\":\"$TASK\"}}") || GOT=""
 
-  printf '%s' "$GOT" | SEEN=$SEEN python3 -c '
+  if printf '%s' "$GOT" | SEEN=$SEEN python3 -c '
 import json, os, sys
 d = json.load(sys.stdin)
 t = d["result"]; st = t["status"]["state"]
@@ -60,7 +63,17 @@ print("__STATE__", st)
 if st in ("TASK_STATE_COMPLETED", "TASK_STATE_FAILED"):
     print("\n--- " + st.replace("TASK_STATE_","") + " ---")
     print("".join(p.get("text","") for p in t["status"]["message"]["parts"]))
-' > /tmp/a2a.$$ 2>/dev/null || { echo "poll failed"; exit 1; }
+' > /tmp/a2a.$$ 2>/dev/null; then
+    FAILS=0
+  else
+    FAILS=$((FAILS + 1))
+    rm -f /tmp/a2a.$$
+    if [ "$FAILS" -ge 30 ]; then
+      echo "poll: 30 consecutive failures (~5 min) — giving up on polling; task may still be running" >&2
+      exit 1
+    fi
+    continue
+  fi
 
   grep -v '^__' /tmp/a2a.$$ || true
   SEEN=$(sed -n 's/^__SEEN__ //p' /tmp/a2a.$$)

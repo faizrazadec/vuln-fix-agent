@@ -7,6 +7,11 @@
 # Serial on purpose: the big repos (ai-hub, alkaline3) each have 400+ findings, so
 # running them concurrently would hammer Claude usage, CPU and Docker at once.
 set -u
+# Survive a closed terminal / ended SSH session (SIGHUP) — a manual run should not
+# die and orphan in-flight tasks. For a fully detached manual run:
+#   nohup ./scripts/VulnFixAgent >> vuln-run.log 2>&1 &
+# The launchd schedule has no controlling terminal, so it is immune already.
+trap "" HUP
 
 # Operate from the repo root (scripts/ is one level down).
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
