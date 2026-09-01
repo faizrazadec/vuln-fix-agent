@@ -1,0 +1,25 @@
+{
+  "_comment": "Copy this to projects.json and fill in your projects. projects.json is gitignored. Each key is the name a caller uses (./ask.sh \"fix vulns in <name>\"). 'assets' are the Vanta vulnerable-asset names to pull findings for; run `vanta-findings <name>` to check they resolve. 'owner.slack_id' is the Slack member id (U...) tagged in every channel message.",
+
+  "example-container-service": {
+    "repo": "git@github.com:your-org/example-container-service.git",
+    "vanta": {
+      "assets": ["example-service-prod", "example-service-dev"]
+    },
+    "owner": {
+      "name": "Jane Doe",
+      "slack_id": "U000EXAMPLE"
+    }
+  },
+
+  "example-code-only-repo": {
+    "repo": "git@github.com:your-org/example-code-only-repo.git",
+    "vanta": {
+      "assets": ["example-code-only-repo"]
+    },
+    "owner": {
+      "name": "Jane Doe",
+      "slack_id": "U000EXAMPLE"
+    }
+  }
+}

@@ -30,7 +30,9 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
-COPY main.py entrypoint.sh projects.json ./
+COPY main.py entrypoint.sh ./
+# Glob so a fresh clone (example only) still builds; real projects.json is gitignored.
+COPY projects*.json ./
 COPY bin/ /app/bin/
 COPY skills/ /app/skills/
 

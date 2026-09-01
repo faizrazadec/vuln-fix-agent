@@ -11,3 +11,6 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+
+# Project registry — real infra names/IDs; keep local, commit the example only
+projects.json
