@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""List Vanta vulnerabilities for a registered project.
+
+    vanta-findings snapdev-backend            # human-readable
+    vanta-findings snapdev-backend --json     # machine-readable, for the agent
+
+Uses the Vanta REST API (OAuth2 client credentials), not the browser session — a
+scraped `connect.sid` dies on logout AND the GraphQL payload carries a timestamped
+`signedQuery` signature that expires within minutes, so replay is not viable.
+
+Filters come from projects.json, never from the caller, so this cannot be pointed at
+findings outside the registry.
+
+Exit codes: 2 auth/network, 3 unknown project, 4 config missing.
+"""
+
+import json
+import os
+import pathlib
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+REGISTRY = pathlib.Path(__file__).resolve().parent.parent / "projects.json"
+BASE = os.environ.get("VANTA_API_BASE", "https://api.vanta.com")
+CLIENT_ID = os.environ.get("VANTA_CLIENT_ID", "")
+CLIENT_SECRET = os.environ.get("VANTA_CLIENT_SECRET", "")
+# Severity is a global policy, not a per-project knob — every project is scanned at all
+# four levels. Override with VANTA_SEVERITIES="CRITICAL,HIGH" if you ever need to narrow.
+SEVERITIES = [s.strip() for s in
+              os.environ.get("VANTA_SEVERITIES", "CRITICAL,HIGH,MEDIUM,LOW").split(",") if s.strip()]
+
+
+def die(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def post_json(url, payload, headers=None):
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", **(headers or {})},
+    )
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.load(r)
+
+
+def get_json(url, token):
+    req = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.load(r)
+
+
+def get_token():
+    if not CLIENT_ID or not CLIENT_SECRET:
+        die(
+            "VANTA_CLIENT_ID / VANTA_CLIENT_SECRET are not set.\n"
+            "Create them in Vanta: Settings > Developer Console > Create > 'Manage Vanta',\n"
+            "then put both in .env.",
+            4,
+        )
+    try:
+        tok = post_json(
+            f"{BASE}/oauth/token",
+            {
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "scope": "vanta-api.all:read",
+                "grant_type": "client_credentials",
+            },
+        )
+    except urllib.error.HTTPError as e:
+        die(f"Vanta rejected the credentials (HTTP {e.code}): {e.read()[:300]!r}", 2)
+    except Exception as e:  # noqa: BLE001
+        die(f"could not reach Vanta: {e}", 2)
+    return tok["access_token"]
+
+
+def resolve_assets(token, names):
+    """Map human asset names (e.g. llm-gateway-production) to Vanta assetIds.
+
+    The vuln records only carry an opaque targetId, so a name filter has to go through
+    /v1/vulnerable-assets. Matching is exact on name, case-insensitive.
+    """
+    wanted = {n.lower() for n in names}
+    ids = {}
+    cursor = None
+    while True:
+        q = {"pageSize": 100}
+        if cursor:
+            q["pageCursor"] = cursor
+        url = f"{BASE}/v1/vulnerable-assets?" + urllib.parse.urlencode(q)
+        try:
+            body = get_json(url, token)
+        except urllib.error.HTTPError as e:
+            die(f"could not list assets (HTTP {e.code})", 2)
+        res = body.get("results", {})
+        for a in res.get("data", []):
+            if a.get("name", "").lower() in wanted:
+                ids[a["name"]] = a["id"]
+        info = res.get("pageInfo", {})
+        if not info.get("hasNextPage"):
+            break
+        cursor = info.get("endCursor")
+    missing = wanted - {n.lower() for n in ids}
+    if missing:
+        die(f"asset(s) not found in Vanta: {', '.join(sorted(missing))}", 3)
+    return list(ids.values())
+
+
+def fetch(token, params):
+    """Walk every page — the default pageSize is 10, so one call is never the whole set."""
+    out = []
+    cursor = None
+    while True:
+        q = dict(params, pageSize=100)
+        if cursor:
+            q["pageCursor"] = cursor
+        url = f"{BASE}/v1/vulnerabilities?" + urllib.parse.urlencode(q, doseq=True)
+        try:
+            body = get_json(url, token)
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                die("Vanta rejected the token — check the app's scopes.", 2)
+            die(f"Vanta returned HTTP {e.code}: {e.read()[:300]!r}", 2)
+        res = body.get("results", {})
+        out.extend(res.get("data", []))
+        info = res.get("pageInfo", {})
+        if not info.get("hasNextPage"):
+            return out
+        cursor = info.get("endCursor")
+        if not cursor:
+            return out
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    as_json = "--json" in sys.argv
+
+    if not REGISTRY.exists():
+        die(f"missing {REGISTRY}", 4)
+    projects = json.loads(REGISTRY.read_text())
+
+    if not args:
+        die(f"usage: vanta-findings <project> [--json]\nknown: {', '.join(projects)}")
+    name = args[0]
+    if name not in projects:
+        die(f"'{name}' is not a registered project. Known: {', '.join(projects)}", 3)
+
+    cfg = projects[name].get("vanta") or {}
+    owner = projects[name].get("owner") or {}
+    if owner.get("slack_id"):
+        # To stderr so it never corrupts the --json array on stdout, but the agent still sees it.
+        print(f"owner: {owner.get('name','?')} <@{owner['slack_id']}>", file=sys.stderr)
+    token = get_token()
+
+    base = {"isDeactivated": "false"}
+    if cfg.get("integrationId"):
+        base["integrationId"] = cfg["integrationId"]
+
+    # Filter by asset on the SERVER via vulnerableAssetId — the vuln record's targetId is
+    # NOT reliably the asset id (it matched for one image by luck, not for others), so any
+    # client-side id match is wrong. Let Vanta resolve the asset->finding relationship.
+    asset_ids = resolve_assets(token, cfg["assets"]) if cfg.get("assets") else [None]
+
+    found = []
+    for aid in asset_ids:
+        p = dict(base)
+        if aid:
+            p["vulnerableAssetId"] = aid
+        for sev in SEVERITIES:
+            found.extend(fetch(token, dict(p, severity=sev)))
+
+    found.sort(key=lambda v: (v.get("severity") != "CRITICAL", v.get("remediateByDate") or ""))  # CRITICAL first, then soonest SLA
+
+    if as_json:
+        print(json.dumps(found, indent=2))
+        return
+    if not found:
+        print(f"no open findings for {name}")
+        return
+    print(f"{len(found)} open findings for {name}:\n")
+    print(f"  {'PACKAGE':34} {'CVE':18} {'SEV':9} {'FIXED IN':14} REMEDIATE BY")
+    for v in found:
+        print(
+            f"  {(v.get('packageIdentifier') or '?')[:33]:34} "
+            f"{(v.get('name') or '-')[:17]:18} "
+            f"{(v.get('severity') or '?'):9} "
+            f"{(v.get('fixedVersion') or '-')[:13]:14} "
+            f"{(v.get('remediateByDate') or '-')[:10]}"
+        )
+    fixable = sum(1 for v in found if v.get("isFixable"))
+    print(f"\n  {fixable}/{len(found)} have a fix available")
+
+
+if __name__ == "__main__":
+    main()

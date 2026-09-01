@@ -5,16 +5,36 @@ services:
     container_name: a2claude-api
     restart: unless-stopped
     networks: [a2claude-net]
+    # Host-only: reachable from your Mac, not from the LAN.
+    ports: ["127.0.0.1:9999:9999"]
     environment:
       A2A_TOKEN: ${A2A_TOKEN:?set A2A_TOKEN in .env}
       PUBLIC_URL: ${PUBLIC_URL:?set PUBLIC_URL in .env}
       WORKSPACE: /home/agent/workspace
+      # gh pr create needs an API token; SSH can push and sign but cannot open a PR.
+      GH_TOKEN: ${GH_TOKEN:-}
+      GIT_USER_NAME: ${GIT_USER_NAME:-}
+      GIT_USER_EMAIL: ${GIT_USER_EMAIL:-}
+      SSH_AUTH_KEY: ${SSH_AUTH_KEY:-}
+      SSH_SIGN_KEY: ${SSH_SIGN_KEY:-}
+      SSH_KEY_PASSPHRASE: ${SSH_KEY_PASSPHRASE:-}
+      VANTA_CLIENT_ID: ${VANTA_CLIENT_ID:-}
+      VANTA_CLIENT_SECRET: ${VANTA_CLIENT_SECRET:-}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      SLACK_CHANNEL: ${SLACK_CHANNEL:-#development-and-pr-reviews}
     volumes:
       # Claude Code writes its OAuth credentials here. Survives restarts and rebuilds,
       # so the one-time `claude` login is genuinely one-time.
       - claude-auth:/home/agent/.claude
       # Container-owned workspace, not a Mac bind mount. Persists across rebuilds.
       - workspace:/home/agent/workspace
+      # Populated by ./load-keys.sh — Docker Desktop refuses to bind-mount ~/.ssh,
+      # and a volume holding only the 3 needed keys beats sharing the whole directory.
+      - ssh-keys:/ssh-keys:ro
+      # Host Docker daemon, so the agent can build the image and trivy-scan it.
+      # ponytail: root-equivalent access to host Docker — acceptable for an
+      # internal agent; revisit if this ever runs untrusted workloads.
+      - /var/run/docker.sock:/var/run/docker.sock
 
   tunnel:
     image: cloudflare/cloudflared:latest
@@ -27,6 +47,7 @@ services:
 volumes:
   claude-auth:
   workspace:
+  ssh-keys:
 
 networks:
   a2claude-net:

@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Post a short message to the team Slack channel.
+
+    slack-notify "text"                 # posts to the default channel
+    echo "text" | slack-notify          # same, from stdin
+
+Prefers an Incoming Webhook (SLACK_WEBHOOK_URL) — one URL bound to one channel, no
+scopes or bot invites. Falls back to a bot token (SLACK_BOT_TOKEN + SLACK_CHANNEL)
+if you'd rather use chat.postMessage.
+
+Exit 0 on success. Exit 4 if nothing is configured — the agent must treat that as
+"could not notify" and say so, not assume the message was delivered.
+"""
+
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+WEBHOOK = os.environ.get("SLACK_WEBHOOK_URL", "")
+BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
+CHANNEL = os.environ.get("SLACK_CHANNEL", "#development-and-pr-reviews")
+
+
+def die(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def main():
+    text = " ".join(sys.argv[1:]).strip() or sys.stdin.read().strip()
+    if not text:
+        die("usage: slack-notify \"message\"  (or pipe text on stdin)")
+
+    if WEBHOOK:
+        req = urllib.request.Request(
+            WEBHOOK,
+            data=json.dumps({"text": text}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+    elif BOT_TOKEN:
+        req = urllib.request.Request(
+            "https://slack.com/api/chat.postMessage",
+            data=json.dumps({"channel": CHANNEL, "text": text}).encode(),
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "Authorization": f"Bearer {BOT_TOKEN}",
+            },
+        )
+    else:
+        die(
+            "Slack is not configured. Set SLACK_WEBHOOK_URL (an Incoming Webhook for\n"
+            "#development-and-pr-reviews) in .env, or SLACK_BOT_TOKEN + SLACK_CHANNEL.",
+            4,
+        )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            body = r.read().decode(errors="replace")
+        # Webhooks return "ok"; chat.postMessage returns JSON with "ok": true/false.
+        if body.strip() not in ("ok", ""):
+            data = json.loads(body)
+            if not data.get("ok", False):
+                die(f"Slack API error: {data.get('error', body[:200])}", 2)
+        print("sent")
+    except urllib.error.HTTPError as e:
+        die(f"Slack returned HTTP {e.code}: {e.read()[:200].decode(errors='replace')!r}", 2)
+    except Exception as e:  # noqa: BLE001
+        die(f"could not reach Slack: {e}", 2)
+
+
+if __name__ == "__main__":
+    main()

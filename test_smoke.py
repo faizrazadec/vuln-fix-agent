@@ -47,7 +47,7 @@ def test_message_send():
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert "error" not in body, body["error"]
-    text = "".join(p.get("text", "") for p in body["result"]["message"]["parts"])
+    text = "".join(p.get("text", "") for p in body["result"]["task"]["status"]["message"]["parts"])
     assert "PONG" in text, f"unexpected reply: {text!r}"
     print("message/send OK:", text.strip())
 
