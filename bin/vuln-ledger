@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""Per-project remediation ledger — the one bit of state that can't be derived live.
+
+Skip-checks for "already fixed in staging" and "already has an open PR" are derived
+from git and gh at run time (nothing to keep in sync). This ledger records only:
+
+  * notified   — unfixable CVEs already Slacked, so the owner isn't re-pinged daily
+  * resolved   — CVEs an opened PR addressed, as an audit trail
+
+    vuln-ledger <project>                          # print the whole ledger as JSON
+    vuln-ledger <project> notified <CVE>           # exit 0 if already notified, else 1
+    vuln-ledger <project> add-notified <CVE>       # record an unfixable notification
+    vuln-ledger <project> add-resolved <CVE> <url> # record a CVE fixed by a PR
+
+Stored under $STATE_DIR (a persisted volume), one file per project.
+"""
+
+import datetime
+import json
+import os
+import pathlib
+import sys
+
+STATE_DIR = pathlib.Path(os.environ.get("STATE_DIR", "/home/agent/state"))
+
+
+def today():
+    return datetime.date.today().isoformat()
+
+
+def load(project):
+    f = STATE_DIR / f"{project}.json"
+    if f.exists():
+        return json.loads(f.read_text())
+    return {"notified": {}, "resolved": {}}
+
+
+def save(project, data):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    (STATE_DIR / f"{project}.json").write_text(json.dumps(data, indent=2) + "\n")
+
+
+def main():
+    a = sys.argv[1:]
+    if not a:
+        sys.exit("usage: vuln-ledger <project> [notified|add-notified|add-resolved] ...")
+    project = a[0]
+    data = load(project)
+
+    if len(a) == 1:
+        print(json.dumps(data, indent=2))
+        return
+
+    cmd = a[1]
+    if cmd == "notified":
+        # exit 0 = already notified (caller should skip re-Slacking), 1 = not yet
+        sys.exit(0 if a[2] in data["notified"] else 1)
+    elif cmd == "add-notified":
+        data["notified"].setdefault(a[2], today())
+        save(project, data)
+        print(f"recorded notified: {a[2]}")
+    elif cmd == "add-resolved":
+        data["resolved"][a[2]] = {"pr": a[3], "date": today()}
+        save(project, data)
+        print(f"recorded resolved: {a[2]} -> {a[3]}")
+    else:
+        sys.exit(f"unknown command: {cmd}")
+
+
+if __name__ == "__main__":
+    main()

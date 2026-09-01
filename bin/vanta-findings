@@ -152,10 +152,11 @@ def main():
         die(f"'{name}' is not a registered project. Known: {', '.join(projects)}", 3)
 
     cfg = projects[name].get("vanta") or {}
-    owner = projects[name].get("owner") or {}
-    if owner.get("slack_id"):
+    owners = projects[name].get("owners") or []
+    if owners:
         # To stderr so it never corrupts the --json array on stdout, but the agent still sees it.
-        print(f"owner: {owner.get('name','?')} <@{owner['slack_id']}>", file=sys.stderr)
+        tags = ", ".join(f"{o.get('name','?')} <@{o['slack_id']}>" for o in owners if o.get("slack_id"))
+        print(f"owners: {tags}", file=sys.stderr)
     token = get_token()
 
     base = {"isDeactivated": "false"}

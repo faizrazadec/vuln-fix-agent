@@ -45,7 +45,7 @@ ENV HOME=/home/agent
 # volume — so onboarding state was lost every start and `claude -p` refused to run.
 # Pointing the config dir at the volume keeps credentials and config together.
 ENV CLAUDE_CONFIG_DIR=/home/agent/.claude
-RUN mkdir -p /home/agent/.claude /home/agent/workspace /home/agent/.ssh \
+RUN mkdir -p /home/agent/.claude /home/agent/workspace /home/agent/state /home/agent/.ssh \
  && chmod 700 /home/agent/.ssh \
  && chmod +x /app/entrypoint.sh \
  && chown -R agent:agent /home/agent /app

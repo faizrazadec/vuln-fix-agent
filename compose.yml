@@ -11,6 +11,7 @@ services:
       A2A_TOKEN: ${A2A_TOKEN:?set A2A_TOKEN in .env}
       PUBLIC_URL: ${PUBLIC_URL:?set PUBLIC_URL in .env}
       WORKSPACE: /home/agent/workspace
+      STATE_DIR: /home/agent/state
       # gh pr create needs an API token; SSH can push and sign but cannot open a PR.
       GH_TOKEN: ${GH_TOKEN:-}
       GIT_USER_NAME: ${GIT_USER_NAME:-}
@@ -28,6 +29,8 @@ services:
       - claude-auth:/home/agent/.claude
       # Container-owned workspace, not a Mac bind mount. Persists across rebuilds.
       - workspace:/home/agent/workspace
+      # Remediation ledger — survives runs so unfixable CVEs aren't re-Slacked daily.
+      - state:/home/agent/state
       # Populated by ./load-keys.sh — Docker Desktop refuses to bind-mount ~/.ssh,
       # and a volume holding only the 3 needed keys beats sharing the whole directory.
       - ssh-keys:/ssh-keys:ro
@@ -47,6 +50,7 @@ services:
 volumes:
   claude-auth:
   workspace:
+  state:
   ssh-keys:
 
 networks:
