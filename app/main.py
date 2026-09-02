@@ -105,6 +105,16 @@ SYSTEM_PROMPT = {
             f"  {name}\n"
             f"    repo:       {p.get('repo', '-')}\n"
             f"    scope:      {', '.join((p.get('vanta') or {}).get('assets', [])) or 'all assets'}"
+            # base_branch is authoritative when set; otherwise the skill auto-detects
+            # (staging → develop → main). Only emitted when pinned, so the absence is the
+            # signal. The reason (e.g. "staging is stale") rides along so the skill can quote
+            # it in the PR's Slack note when the base is main.
+            + (
+                f"\n    base:       {p['base_branch']}"
+                + (f" ({p['base_branch_reason']})" if p.get("base_branch_reason") else "")
+                if p.get("base_branch")
+                else ""
+            )
             for name, p in sorted(PROJECTS.items())
         )
         + "\n\nTo list findings for a project, run: vanta-findings <project-name>"

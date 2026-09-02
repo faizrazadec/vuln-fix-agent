@@ -39,10 +39,14 @@ runs before (processes vanish with no summary). So:
    latest base branch, no stale checkout. First, prune stale clones as a backstop against
    a missed cleanup: `find "$WORKSPACE" -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf {} +`.
 
-3. **Pick the base branch**, first match wins: `staging` → `develop` → `main`/`master`.
-   Check `git branch -r`, do not assume. Prefer `staging` or `develop`; only fall back to
-   `main`/`master` when NEITHER exists. Remember whether you fell back to main — the PR
-   message must warn about it (step 8).
+3. **Pick the base branch.** If the project registry in your system prompt gives this
+   project a `base:` branch, that is authoritative — use exactly that branch as the base,
+   do not auto-detect (confirm it exists with `git branch -r`; if it somehow does not, stop
+   and Slack the owner rather than guessing). Otherwise auto-detect, first match wins:
+   `staging` → `develop` → `main`/`master`. Check `git branch -r`, do not assume. Prefer
+   `staging` or `develop`; only fall back to `main`/`master` when NEITHER exists. Remember
+   whether you landed on main — whether configured or by fallback, the PR message must warn
+   about it (step 8).
 
    **Then choose your working branch — reuse an open vuln-fix PR, never stack a second one:**
    `gh pr list --state open --json number,headRefName,body`.
@@ -193,9 +197,14 @@ runs before (processes vanish with no summary). So:
      The PR body lists each CVE with before/after versions, baseline-vs-final test status, and
      image scan before/after. Then Slack:
      `send, tagging the owner: ":white_check_mark: <@owner1> <@owner2 …> <project>: opened PR <url> — fixed N vulns, tests + image green. Ready for your review."`
-     **If you fell back to `main`/`master` as the base** (no staging or develop existed),
-     append a caution to that same message so the owner is careful:
-     ` :rotating_light: heads-up: this PR targets \`main\` because the repo has no staging/develop branch — review extra carefully before merging.`
+     **If the PR targets `main`/`master`,** append a caution to that same message so the
+     owner is careful, matching the reason:
+     - Fell back to main because no staging/develop existed:
+       ` :rotating_light: heads-up: this PR targets \`main\` because the repo has no staging/develop branch — review extra carefully before merging.`
+     - Main is the project's configured base branch: state the reason the registry gives
+       (its `base:` line, e.g. `main (staging is stale)`); if none is given, just say it is
+       the configured base:
+       ` :rotating_light: heads-up: this PR targets \`main\` (the configured base for this project — <reason>) — review extra carefully before merging.`
      Then record each fixed CVE: `vuln-ledger <project> add-resolved <CVE> <pr-url>`.
 
    - **A fix broke something** (tests regressed vs baseline, or the image fails to build
