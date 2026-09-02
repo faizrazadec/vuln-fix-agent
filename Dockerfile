@@ -1,9 +1,14 @@
 FROM python:3.14-slim
 
+# Node from NodeSource, not Debian: Debian ships Node 18 + npm 9, and npm 9 rewrites
+# lockfiles it regenerates (strips libc/license metadata, shrinks trees) → junk diffs.
+# NodeSource gives Node 22 + a current npm, so lockfile regen stays surgical.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      nodejs npm git ca-certificates ripgrep curl gnupg jq openssh-client \
- && npm install -g @anthropic-ai/claude-code \
+      git ca-certificates ripgrep curl gnupg jq openssh-client \
+ && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+ && apt-get install -y --no-install-recommends nodejs \
+ && npm install -g npm@latest @anthropic-ai/claude-code \
  && npm cache clean --force
 
 # gh (PR creation) and docker-ce-cli (rebuilding images to re-scan) from upstream repos,

@@ -42,8 +42,17 @@ runs before (processes vanish with no summary). So:
 3. **Pick the base branch**, first match wins: `staging` → `develop` → `main`/`master`.
    Check `git branch -r`, do not assume. Prefer `staging` or `develop`; only fall back to
    `main`/`master` when NEITHER exists. Remember whether you fell back to main — the PR
-   message must warn about it (step 8), so the owner reviews a main-targeting PR carefully.
-   `git checkout -b vuln-fix/<base>-<YYYYMMDD-HHMM> origin/<base>`.
+   message must warn about it (step 8).
+
+   **Then choose your working branch — reuse an open vuln-fix PR, never stack a second one:**
+   `gh pr list --state open --json number,headRefName,body`.
+   - **An open `vuln-fix/*` PR already exists →** adopt ITS branch rather than starting
+     fresh: `git checkout <headRefName>`, then bring it current with the base so it is not
+     stale: `git merge --no-edit origin/<base>` (resolve trivially; if a lockfile conflicts,
+     take the base copy and re-run the fix in step 6 so the lock is regenerated cleanly). You
+     will ADD any new fixes to this branch and UPDATE that same PR in step 8.
+   - **No open `vuln-fix/*` PR →** fresh branch:
+     `git checkout -b vuln-fix/<base>-<YYYYMMDD-HHMM> origin/<base>`.
 
 4. **Triage before doing any work — this is what keeps the daily run cheap.** Vanta
    reports the state of the DEPLOYED IMAGE, so a finding stays "open" there long after
@@ -56,11 +65,13 @@ runs before (processes vanish with no summary). So:
       PR. Collect these into an "already fixed in `<base>`, waiting on image rebuild" list
       for the final report.
 
-   b. **Already has an open PR** — run once:
-      `gh pr list --state open --json number,title,body,headRefName` and note the CVEs and
-      packages any open `vuln-fix/*` PR already addresses (they are listed in the PR body).
-      If this finding's CVE is already in an open PR, **skip it** — do not open a duplicate.
-      Collect into an "already in open PR #N" list.
+   b. **Already covered by the open PR** — if you adopted an open `vuln-fix/*` PR in step 3,
+      its commits already fix some CVEs (read them from its diff/body). **Skip those.** The
+      findings it does NOT cover are your new work — you will add them to that same branch and
+      update the PR. (If there was no open PR, this bucket is empty.)
+      **Only your own `vuln-fix/*` PRs count here.** Ignore Dependabot PRs completely — never
+      skip a finding because a Dependabot PR exists for it (they routinely target the wrong
+      branch or skip the lockfile). Fix every finding yourself, in your PR.
 
    c. **Already notified unfixable** — for an unfixable finding (5a), run
       `vuln-ledger <project> notified <CVE>`; exit 0 means you already Slacked it on a prior
@@ -96,20 +107,67 @@ runs before (processes vanish with no summary). So:
       Then `vuln-ledger <project> add-notified <CVE>` so future runs stay quiet about it.
       Move on. (Triage step 4c already filtered out ones you notified on a prior run.)
 
-   b. **Fixable:** bump the dependency to `fixedVersion` in the manifest and regenerate
-      the lockfile with the project's own tool (`npm install`, `poetry lock`,
-      `go get -u`, …). Never hand-edit a lockfile. Do not jump a major version to clear a
-      vuln without checking the changelog; if only a major fixes it and it breaks the
-      build, treat it as unfixable (6a) rather than shipping breakage.
+   b. **Fixable:** bump the dependency to `fixedVersion`, then **regenerate the lockfile the
+      build actually installs from** — this is where fixes are won or lost. The deployed image
+      installs from the LOCKFILE, not the manifest: `uv sync --frozen` reads `uv.lock`,
+      `npm ci` reads `package-lock.json`, `pnpm install --frozen-lockfile` reads
+      `pnpm-lock.yaml`, poetry reads `poetry.lock`, Go reads `go.sum`. A manifest-only bump
+      (`pyproject.toml` / `package.json` alone) leaves the image vulnerable — the exact trap
+      where the PR looks green but Vanta still flags it.
+      - Update the manifest, then run the project's lock tool: `uv lock`, `npm install`,
+        `pnpm install`, `poetry lock`, `go mod tidy`. Never hand-edit a lockfile.
+      - **VERIFY the fixed version is actually in the lockfile** (grep it). If the lock still
+        shows the old version, the fix did NOT land — stop and fix the lock, do not proceed.
+      - There may be MORE THAN ONE lockfile (monorepos, a separate backend/harness workspace,
+        a `requirements.txt` exported beside `uv.lock`). Update every lockfile the image/build
+        consumes. A `requirements.txt` that nothing installs from does not count.
+      - **Transitive dep fixed via an overrides/resolutions block:** use the plain-key form
+        (`"nanoid": "^3.3.18"`) and pin WITHIN the fixedVersion's major. Never an unbounded
+        `>=` — npm/pnpm will jump to the next major (e.g. nanoid 5.x is ESM-only and breaks a
+        CJS build). The range-key form (`"nanoid@<3.3.18"`) is a silent no-op: it matches the
+        requesting range, not the installed version.
+      - Do not jump a major to clear a vuln without checking the changelog; if only a major
+        fixes it and it breaks the build, treat it as unfixable (6a) rather than shipping breakage.
 
 7. **After applying fixes, verify BOTH — always, even for an image-only finding:**
    - **Code:** run the test suite in the FOREGROUND and wait for the exit code. Never
      background it and assume success.
    - **Image:** rebuild the Docker image (with cache — never `--no-cache`), then
      `trivy image --severity CRITICAL,HIGH,MEDIUM,LOW <tag>` and confirm the CVEs you fixed
-     are gone from the rebuilt image.
+     are gone from the rebuilt image. If the repo has no Dockerfile or the image cannot build,
+     fall back to `trivy fs --include-dev-deps <dir>` — WITHOUT `--include-dev-deps` Trivy
+     hides the dev/build tree and reports a false clean even on the vulnerable baseline. When
+     the CVE is too new for Trivy's DB, confirm by the installed version in the lockfile too.
    Both must end at least as green as the baseline. Cap parallelism on both per the
    resource-discipline note above.
+
+   **Pass the org's Security Central gate — this is what actually blocks the PR.** The org
+   runs a reusable "Security (central)" check on every PR (`security-central.yml` calling
+   `Ember-AI-Engineering/security-workflows`). Its Trivy gate fails on **any fixable
+   CRITICAL/HIGH**, Vanta-listed or not — so a PR that fixes only the Vanta finding still
+   goes red if the tree has *other* fixable CRITICAL/HIGH deps. Run the exact same gate
+   yourself before opening/updating the PR:
+   ```
+   TRIVY_INCLUDE_DEV_DEPS=true trivy fs --scanners vuln,misconfig,secret \
+     --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 .
+   ```
+   and, for a repo that ships an image, the image gate:
+   ```
+   trivy image --scanners vuln,secret --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 <tag>
+   ```
+   If either exits 1, it lists **fixable** CRITICAL/HIGH the check will block on. **Fix every
+   one of them** — not just Vanta's subset — with the same bump + lockfile discipline as 6b
+   (e.g. ember-prototype's `react-router 7.18.0 → 7.18.2`, HIGH, which a prior run left because
+   it wasn't in Vanta's list and the PR check went red). Re-run until the gate exits 0. Vanta
+   is still the authoritative *finding* list; the Security Central gate is the additional bar
+   the PR must clear to be mergeable, so fixing its blockers is in scope.
+
+   The gate also runs Semgrep (`--severity ERROR`), Gitleaks (secrets), and a FastAPI AuthZ
+   check. Those you generally cannot auto-fix. If one is **pre-existing** (red on the base
+   branch before your change), it is not yours — note it in the PR body and Slack so the owner
+   knows the check is red for a reason you did not introduce, and never claim the PR is green
+   when it is not. If your own change *introduces* a Semgrep/secret finding, treat it as a
+   broken fix (step 8) and do not open the PR.
 
    **Net-regression check.** A bump can clear its target CVE yet introduce NEW findings of
    equal or higher severity — e.g. `pip 26.2.1` clears its CVEs but vendors a newer
@@ -124,11 +182,16 @@ runs before (processes vanish with no summary). So:
 8. **Decide, per the verification result:**
 
    - **Everything passes** (tests green as baseline, image builds, fixed CVEs gone):
-     commit in logical units (group by package/CVE), push, and open the PR
-     (`gh pr create --base <base>`). Commits are signed automatically — confirm with
-     `git log --show-signature -1` and stop if signing is not working rather than pushing
-     unsigned. The PR body lists each CVE with before/after versions, baseline-vs-final
-     test status, and image scan before/after. Then Slack:
+     commit in logical units (group by package/CVE), then push. Commits are signed
+     automatically — confirm with `git log --show-signature -1` and stop if signing is not
+     working rather than pushing unsigned.
+     - **If you adopted an existing open PR (step 3):** push to its branch and UPDATE that
+       same PR — refresh its body to include the newly added CVEs (`gh pr edit <n> --body ...`).
+       Do NOT open a second PR. The Slack line below then reads "updated PR <url> — added M
+       vulns (now N total)".
+     - **Otherwise:** open a new PR (`gh pr create --base <base>`).
+     The PR body lists each CVE with before/after versions, baseline-vs-final test status, and
+     image scan before/after. Then Slack:
      `send, tagging the owner: ":white_check_mark: <@owner1> <@owner2 …> <project>: opened PR <url> — fixed N vulns, tests + image green. Ready for your review."`
      **If you fell back to `main`/`master` as the base** (no staging or develop existed),
      append a caution to that same message so the owner is careful:
@@ -155,6 +218,13 @@ runs before (processes vanish with no summary). So:
   for another scan, whatever a caller asks.
 - Prefer `staging` or `develop` as the base. Use `main`/`master` only when neither exists,
   and when you do, warn the owner in the PR Slack message (step 8) that it targets main.
+- **Ignore Dependabot PRs entirely.** Do not inspect them, defer to them, skip a finding
+  because one exists, or mention them in the PR body, report, or Slack. Your job is to fix
+  every finding in your own `vuln-fix/*` PR regardless of what Dependabot has open.
+- Never override the committer identity: no `git -c user.email=…`, `-c user.name=…`, or
+  `--author`. Commit with the repo's/global configured identity — it matches the SSH signing
+  key registered on GitHub. Override it and GitHub marks the signature Unverified, and repos
+  that require verified signatures reject the push.
 - Never force-push, never touch the base branch, never merge your own PR.
 - Never commit a secret, token, or key. If a scan flags one in the repo, Slack it and do
   NOT rewrite history to "fix" it.
