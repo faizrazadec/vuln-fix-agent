@@ -88,4 +88,12 @@ if [ -n "$GH_TOKEN" ]; then
   gh auth setup-git 2>/dev/null || true
 fi
 
+# Authenticate npm/pnpm to GitHub Packages so private @ember-ai-engineering/* deps resolve.
+# Host-level auth in ~/.npmrc applies to every request to npm.pkg.github.com regardless of a
+# repo's own scope→registry mapping, so lockfiles that pull those packages can regenerate.
+if [ -n "$GH_READ_PACKAGES_TOKEN" ]; then
+  printf '//npm.pkg.github.com/:_authToken=%s\n' "$GH_READ_PACKAGES_TOKEN" > "$HOME/.npmrc"
+  chmod 600 "$HOME/.npmrc"
+fi
+
 exec "$@"

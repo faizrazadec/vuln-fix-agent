@@ -14,6 +14,12 @@ services:
       STATE_DIR: /home/agent/state
       # gh pr create needs an API token; SSH can push and sign but cannot open a PR.
       GH_TOKEN: ${GH_TOKEN:-}
+      # read:packages token for private GitHub Packages (npm.pkg.github.com). Exposed under
+      # the names repo .npmrc files reference (PACKAGES_READ_TOKEN / NODE_AUTH_TOKEN) plus
+      # its own, so `npm ci` / `pnpm install` on @ember-ai-engineering/* deps stop 403ing.
+      GH_READ_PACKAGES_TOKEN: ${GH_READ_PACKAGES_TOKEN:-}
+      PACKAGES_READ_TOKEN: ${GH_READ_PACKAGES_TOKEN:-}
+      NODE_AUTH_TOKEN: ${GH_READ_PACKAGES_TOKEN:-}
       GIT_USER_NAME: ${GIT_USER_NAME:-}
       GIT_USER_EMAIL: ${GIT_USER_EMAIL:-}
       SSH_AUTH_KEY: ${SSH_AUTH_KEY:-}
