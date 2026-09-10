@@ -35,8 +35,8 @@ uv run python tests/test_smoke.py            # end-to-end — spawns real Claude
 uv run python tests/test_smoke.py --card-only  # agent-card assertions only, no quota
 
 docker compose up -d --build
-docker compose logs -f vuln-fix-agent-api
-docker compose exec -it vuln-fix-agent-api claude   # the one-time interactive login
+docker compose logs -f vuln-fix-agent
+docker compose exec -it vuln-fix-agent claude   # the one-time interactive login
 ```
 
 Tests are plain scripts with `assert` and an `__main__` block — no pytest, no fixtures.

@@ -1,8 +1,8 @@
 services:
-  vuln-fix-agent-api:
+  vuln-fix-agent:
     build: .
     image: vuln-fix-agent:latest
-    container_name: vuln-fix-agent-api
+    container_name: vuln-fix-agent
     restart: unless-stopped
     networks: [vuln-fix-agent-net]
     # Host-only: reachable from your Mac, not from the LAN.

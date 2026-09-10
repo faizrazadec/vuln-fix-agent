@@ -29,4 +29,4 @@ done
 # uid 1000 = the `agent` user the server runs as.
 docker exec vuln-fix-agent-keyload sh -c 'chown -R 1000:1000 /ssh-keys && chmod 600 /ssh-keys/* && chmod 644 /ssh-keys/*.pub'
 docker rm -f vuln-fix-agent-keyload >/dev/null
-echo "done — restart with: docker compose up -d vuln-fix-agent-api"
+echo "done — restart with: docker compose up -d vuln-fix-agent"
