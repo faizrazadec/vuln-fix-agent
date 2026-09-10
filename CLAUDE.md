@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**Read [AGENTS.md](AGENTS.md) at the start of a session.** This file explains how the code is
+designed; AGENTS.md records the live deployment — container and volume names, the SSH key in
+use, the schedule, operational gotchas, and a dated change log. Keep it current when
+infrastructure changes.
+
 ## What this is
 
 An A2A (Agent2Agent) protocol server that exposes Claude Code as a callable agent.
