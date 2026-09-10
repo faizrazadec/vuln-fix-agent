@@ -83,7 +83,7 @@ def send(text, return_immediately):
 
 def test_card():
     card = client.get(main.CARD_PATH).json()
-    assert card["name"] == "Claude Code", card
+    assert card["name"] == "Vuln Fix Agent", card
     assert card["supportedInterfaces"][0]["url"] == main.PUBLIC_URL + main.RPC_PATH, card
     print("card OK")
 

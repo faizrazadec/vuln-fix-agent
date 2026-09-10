@@ -3,7 +3,7 @@
 #
 #   ./ask.sh "fix vulns in git@github.com:Ember-AI-Engineering/snapdev-backend.git"
 #   ./ask.sh -f request.txt          # long prompt from a file
-#   A2A_URL=https://api-a2claude.faizraza.me/ ./ask.sh "..."   # via the tunnel
+#   A2A_URL=https://agent.example.com/ ./ask.sh "..."   # if fronted by a proxy
 #
 # Sends returnImmediately so the run survives any HTTP timeout, then polls GetTask
 # until it finishes. Prints progress as the agent works.

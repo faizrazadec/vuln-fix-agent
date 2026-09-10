@@ -221,7 +221,7 @@ class ClaudeCodeExecutor(AgentExecutor):
 
 
 agent_card = AgentCard(
-    name="Claude Code",
+    name="Vuln Fix Agent",
     description="Runs a Claude Code session in a project workspace and returns the result.",
     version="1.0.0",
     capabilities=AgentCapabilities(streaming=False),

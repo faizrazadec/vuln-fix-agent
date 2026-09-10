@@ -23,7 +23,7 @@ def test_agent_card():
     card = client.get("/.well-known/agent-card.json")
     assert card.status_code == 200, card.text
     body = card.json()
-    assert body["name"] == "Claude Code"
+    assert body["name"] == "Vuln Fix Agent"
     assert body["supportedInterfaces"][0]["url"]== PUBLIC_URL + "/"
     assert body["skills"][0]["id"] == "code"
     print("agent card OK:", body["supportedInterfaces"][0]["url"])

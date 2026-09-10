@@ -35,8 +35,8 @@ uv run python tests/test_smoke.py            # end-to-end — spawns real Claude
 uv run python tests/test_smoke.py --card-only  # agent-card assertions only, no quota
 
 docker compose up -d --build
-docker compose logs -f a2claude-api
-docker compose exec -it a2claude-api claude   # the one-time interactive login
+docker compose logs -f vuln-fix-agent-api
+docker compose exec -it vuln-fix-agent-api claude   # the one-time interactive login
 ```
 
 Tests are plain scripts with `assert` and an `__main__` block — no pytest, no fixtures.
@@ -81,8 +81,10 @@ badge never appears.
   `$HOME/.claude` and therefore *outside* the volume, so onboarding state was lost every start.
 
 The image also carries `gh`, `docker-ce-cli`, and `trivy` — the vuln-fix workflow shells out
-to all three. `compose.yml` pairs the API with a `cloudflared` tunnel; `PUBLIC_URL` is baked
-into the agent card and must match the hostname routed to that tunnel.
+to all three. The stack is local-only: the API binds `127.0.0.1:9999` and nothing fronts it.
+`PUBLIC_URL` is still what gets baked into the agent card as the endpoint callers dial, and
+defaults to that host port; put the agent behind a tunnel or proxy and it must be set to the
+hostname routed there, or the card advertises an address that doesn't reach the server.
 
 `GH_TOKEN` is separate from the SSH keys on purpose: SSH can push and sign, but opening a PR
 needs the REST API.

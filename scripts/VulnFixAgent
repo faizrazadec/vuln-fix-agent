@@ -1,6 +1,6 @@
 #!/bin/bash
 # Fire the vuln-fix agent for every registered project, one at a time.
-# Meant to be run on a schedule (see com.faizraza.a2claude.vulnrun.plist).
+# Meant to be run on a schedule (see com.faizraza.vuln-fix-agent.vulnrun.plist).
 #
 #   ./VulnFixAgent          # run all projects serially
 #
@@ -17,7 +17,7 @@ trap "" HUP
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$DIR"
 
-LOCK="/tmp/a2claude-run-all.lock"
+LOCK="/tmp/vuln-fix-agent-run-all.lock"
 LOG_TS() { date '+%Y-%m-%d %H:%M:%S'; }
 
 # --- single-instance lock (mkdir is atomic) -------------------------------------
@@ -35,7 +35,7 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 # --- the agent must be reachable ------------------------------------------------
 CARD="http://127.0.0.1:9999/.well-known/agent-card.json"
 if ! curl -sf -m 10 -o /dev/null "$CARD"; then
-  echo "$(LOG_TS) agent not reachable at $CARD — is the a2claude container up? aborting"
+  echo "$(LOG_TS) agent not reachable at $CARD — is the vuln-fix-agent container up? aborting"
   exit 1
 fi
 

@@ -8,11 +8,11 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.faizraza.a2claude.vulnrun</string>
+  <string>com.faizraza.vuln-fix-agent.vulnrun</string>
 
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/muhammadfaizraza/Remotebase/a2claude/scripts/VulnFixAgent</string>
+    <string>/Users/muhammadfaizraza/Remotebase/vuln-fix-agent/scripts/VulnFixAgent</string>
   </array>
 
   <key>StartCalendarInterval</key>
@@ -28,11 +28,11 @@
   <false/>
 
   <key>StandardOutPath</key>
-  <string>/Users/muhammadfaizraza/Remotebase/a2claude/vuln-run.log</string>
+  <string>/Users/muhammadfaizraza/Remotebase/vuln-fix-agent/vuln-run.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/muhammadfaizraza/Remotebase/a2claude/vuln-run.log</string>
+  <string>/Users/muhammadfaizraza/Remotebase/vuln-fix-agent/vuln-run.log</string>
 
   <key>WorkingDirectory</key>
-  <string>/Users/muhammadfaizraza/Remotebase/a2claude</string>
+  <string>/Users/muhammadfaizraza/Remotebase/vuln-fix-agent</string>
 </dict>
 </plist>

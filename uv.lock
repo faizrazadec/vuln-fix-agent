@@ -32,7 +32,7 @@ http-server = [
 ]
 
 [[package]]
-name = "a2claude"
+name = "vuln-fix-agent"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

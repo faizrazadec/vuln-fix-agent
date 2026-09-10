@@ -1,15 +1,17 @@
 services:
-  a2claude-api:
+  vuln-fix-agent-api:
     build: .
-    image: a2claude:latest
-    container_name: a2claude-api
+    image: vuln-fix-agent:latest
+    container_name: vuln-fix-agent-api
     restart: unless-stopped
-    networks: [a2claude-net]
+    networks: [vuln-fix-agent-net]
     # Host-only: reachable from your Mac, not from the LAN.
     ports: ["127.0.0.1:9999:9999"]
     environment:
       A2A_TOKEN: ${A2A_TOKEN:?set A2A_TOKEN in .env}
-      PUBLIC_URL: ${PUBLIC_URL:?set PUBLIC_URL in .env}
+      # Baked into the agent card as the endpoint callers dial. Local-only now, so the
+      # host port is the honest answer; set PUBLIC_URL in .env if this is ever exposed.
+      PUBLIC_URL: ${PUBLIC_URL:-http://127.0.0.1:9999}
       WORKSPACE: /home/agent/workspace
       STATE_DIR: /home/agent/state
       # gh pr create needs an API token; SSH can push and sign but cannot open a PR.
@@ -45,14 +47,6 @@ services:
       # internal agent; revisit if this ever runs untrusted workloads.
       - /var/run/docker.sock:/var/run/docker.sock
 
-  tunnel:
-    image: cloudflare/cloudflared:latest
-    container_name: a2claude-tunnel
-    restart: unless-stopped
-    networks: [a2claude-net]
-    command: tunnel --no-autoupdate run --token ${TUNNEL_TOKEN:?set TUNNEL_TOKEN in .env}
-    depends_on: [a2claude-api]
-
 volumes:
   claude-auth:
   workspace:
@@ -60,5 +54,5 @@ volumes:
   ssh-keys:
 
 networks:
-  a2claude-net:
-    name: a2claude-net
+  vuln-fix-agent-net:
+    name: vuln-fix-agent-net

@@ -157,7 +157,7 @@ runs before (processes vanish with no summary). So:
    resource-discipline note above.
 
    **Tag and run so the artifacts are cleanable (step 9 depends on this).** Tag EVERY image
-   you build under the `a2claude-verify/<project>` namespace — e.g. `a2claude-verify/<project>:base`
+   you build under the `vuln-fix-agent-verify/<project>` namespace — e.g. `vuln-fix-agent-verify/<project>:base`
    and `:fixed` — never a bare `<project>:baseline`, so cleanup can find them and only them,
    without touching unrelated images on the shared daemon. If you run the image to execute
    tests, always `docker run --rm ...` so no stopped container is left behind. The daemon is
@@ -250,11 +250,11 @@ runs before (processes vanish with no summary). So:
    leaves stopped containers, built images, and clone dirs piling up on a shared daemon.
 
    - **Docker (always, every outcome).** Remove the images you built for this project and any
-     containers from them — scoped to your `a2claude-verify/<project>` namespace so nothing
+     containers from them — scoped to your `vuln-fix-agent-verify/<project>` namespace so nothing
      else is touched:
      ```
-     docker ps  -aq --filter "ancestor=a2claude-verify/<project>:base"  --filter "ancestor=a2claude-verify/<project>:fixed" | xargs -r docker rm -f
-     docker images -q "a2claude-verify/<project>" | xargs -r docker rmi -f
+     docker ps  -aq --filter "ancestor=vuln-fix-agent-verify/<project>:base"  --filter "ancestor=vuln-fix-agent-verify/<project>:fixed" | xargs -r docker rm -f
+     docker images -q "vuln-fix-agent-verify/<project>" | xargs -r docker rmi -f
      docker image prune -f --filter "dangling=true" --filter "label=stage"  # only your build's dangling layers
      ```
      (If you followed the `--rm` rule there are no containers to remove — this is the backstop.)
