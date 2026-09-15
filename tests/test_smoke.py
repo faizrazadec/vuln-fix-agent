@@ -25,7 +25,10 @@ def test_agent_card():
     body = card.json()
     assert body["name"] == "Vuln Fix Agent"
     assert body["supportedInterfaces"][0]["url"]== PUBLIC_URL + "/"
-    assert body["skills"][0]["id"] == "code"
+    # The card advertises what this agent actually does, so a caller discovering it learns
+    # the project names to ask for rather than a generic "Code" skill.
+    assert body["skills"][0]["id"] == "vuln-fix"
+    assert "Registered projects:" in body["skills"][0]["description"], body["skills"][0]
     print("agent card OK:", body["supportedInterfaces"][0]["url"])
 
 

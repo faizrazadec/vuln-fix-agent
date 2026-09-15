@@ -14,6 +14,9 @@ services:
       PUBLIC_URL: ${PUBLIC_URL:-http://127.0.0.1:9999}
       WORKSPACE: /home/agent/workspace
       STATE_DIR: /home/agent/state
+      # How long an "unfixable, already notified" CVE stays suppressed before it resurfaces
+      # even if nothing about it changed. 0 disables the TTL (suppression by version only).
+      LEDGER_NOTIFY_TTL_DAYS: ${LEDGER_NOTIFY_TTL_DAYS:-90}
       # gh pr create needs an API token; SSH can push and sign but cannot open a PR.
       GH_TOKEN: ${GH_TOKEN:-}
       # read:packages token for private GitHub Packages (npm.pkg.github.com). Exposed under
@@ -37,8 +40,16 @@ services:
       - claude-auth:/home/agent/.claude
       # Container-owned workspace, not a Mac bind mount. Persists across rebuilds.
       - workspace:/home/agent/workspace
-      # Remediation ledger — survives runs so unfixable CVEs aren't re-Slacked daily.
+      # Remediation ledger, per-run JSON summaries, and task state — all of it has to
+      # outlive both a run and a rebuild.
       - state:/home/agent/state
+      # Trivy's vulnerability DB is ~1.3GB. Left in the container's writable layer it was
+      # re-downloaded from scratch after every rebuild, and bloated the layer meanwhile.
+      - trivy-cache:/home/agent/.cache/trivy
+      # The registry is also COPYed into the image, but mounting it means editing
+      # projects.json takes effect on restart instead of requiring a rebuild — the host
+      # (scripts/VulnFixAgent reads this same file) and the container cannot drift apart.
+      - ./app/projects.json:/app/projects.json:ro
       # Populated by ./load-keys.sh — Docker Desktop refuses to bind-mount ~/.ssh,
       # and a volume holding only the 3 needed keys beats sharing the whole directory.
       - ssh-keys:/ssh-keys:ro
@@ -51,6 +62,7 @@ volumes:
   claude-auth:
   workspace:
   state:
+  trivy-cache:
   ssh-keys:
 
 networks:

@@ -3,7 +3,10 @@
 The `claude` CLI must be logged in (run `claude` once, interactively). No ANTHROPIC_API_KEY.
 """
 
+import asyncio
+import datetime
 import json
+import logging
 import os
 import pathlib
 import re
@@ -48,35 +51,88 @@ from claude_agent_sdk import (
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+log = logging.getLogger("vuln-fix-agent")
+
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "http://localhost:9999")
 WORKSPACE = os.environ.get("WORKSPACE", os.getcwd())
+STATE_DIR = pathlib.Path(os.environ.get("STATE_DIR", "/home/agent/state"))
 TOKEN = os.environ.get("A2A_TOKEN")
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "200"))
 # The pipeline lives in skills/vuln-fix/SKILL.md, which entrypoint.sh installs into
 # $CLAUDE_CONFIG_DIR/skills. Only a pointer goes in the prompt — a bare string here would
 # send --system-prompt and REPLACE Claude Code's own prompt; preset+append adds to it.
-# Only these repos may be cloned. Enforced here rather than in the prompt: the endpoint
-# is reachable from the internet, and a prompt rule is advice, not a boundary.
 _pf = pathlib.Path(__file__).with_name("projects.json")
 PROJECTS: dict[str, dict] = json.loads(_pf.read_text()) if _pf.exists() else {}
 ALLOWED_URLS = {p["repo"] for p in PROJECTS.values() if p.get("repo")}
 # Vanta filters live under each project's "vanta" key and are read by bin/vanta-findings
 # straight from this registry, so a caller cannot widen them.
 
-# git@host:path.git, https://host/path(.git), ssh://…
+# ---------------------------------------------------------------------------
+# Repo allowlist
+#
+# This catches a caller who *names* an unregistered repository in the request. It is a
+# guard rail, not a sandbox: the session runs with permission_mode="bypassPermissions",
+# so a determined prompt can still reach the network by other means. The real boundary is
+# that the endpoint binds 127.0.0.1 and the bearer token gates every RPC. Keep both.
+#
+# Three spellings have to be recognised, because all three were demonstrably slipping
+# through an earlier scheme-and-git@-only pattern:
+#   git@github.com:owner/repo.git   https://github.com/owner/repo   HTTPS://GitHub.com/...
+#   github.com/owner/repo           (no scheme)
+#   clone owner/repo                (gh/git shorthand, no host at all)
+# ---------------------------------------------------------------------------
+_GIT_HOSTS = r"(?:github\.com|gitlab\.com|bitbucket\.org|codeberg\.org|ssh\.dev\.azure\.com)"
+_END = r"(?=[\s,;'\")\]]|$)"
+
 _URL_RE = re.compile(
-    r"(?:git@[\w.-]+:[\w./-]+?(?:\.git)?|(?:https?|ssh|git)://[\w.@:-]+/[\w./-]+?(?:\.git)?)(?=[\s,;'\")\]]|$)"
+    r"(?:git@[\w.-]+:[\w./-]+?(?:\.git)?"
+    r"|(?:https?|ssh|git)://[\w.@:-]+/[\w./-]+?(?:\.git)?"
+    r"|\b" + _GIT_HOSTS + r"[:/][\w.-]+/[\w./-]+?(?:\.git)?)" + _END,
+    re.IGNORECASE,
+)
+# `gh repo clone owner/repo`, `git clone owner/repo`, `clone owner/repo`. Anchored on the
+# verb so ordinary prose containing a slash ("app/main.py") is not mistaken for a repo.
+_SHORTHAND_RE = re.compile(
+    r"\bclone\s+(?:-{1,2}\S+\s+)*([\w.-]+/[\w.-]+?)(?:\.git)?" + _END,
+    re.IGNORECASE,
 )
 
 
+def _norm_repo(url: str) -> str:
+    """Reduce any spelling of a repo reference to `host/owner/repo`, lowercased.
+
+    GitHub treats owner and repo case-insensitively, so comparing case-sensitively would
+    refuse legitimate requests without blocking anything.
+    """
+    u = url.strip().rstrip("/")
+    u = re.sub(r"^(?:https?|ssh|git)://", "", u, flags=re.IGNORECASE)
+    u = re.sub(r"^git@", "", u, flags=re.IGNORECASE)
+    u = u.replace(":", "/", 1) if "@" not in u.split("/")[0] else u
+    if u.lower().endswith(".git"):
+        u = u[:-4]
+    return re.sub(r"/{2,}", "/", u).lower()
+
+
+def _repo_path(url: str) -> str:
+    """The `owner/repo` tail of a normalised reference, for matching host-less shorthand."""
+    parts = _norm_repo(url).split("/")
+    return "/".join(parts[-2:]) if len(parts) >= 2 else ""
+
+
 def _disallowed_urls(text: str) -> list[str]:
-    """Any repo URL in the request that is not in the registry."""
-    found = {u.rstrip("/") for u in _URL_RE.findall(text)}
-    allowed = {u.rstrip("/") for u in ALLOWED_URLS}
-    # Compare ignoring a trailing .git so both spellings of the same repo match.
-    norm = lambda u: u[:-4] if u.endswith(".git") else u  # noqa: E731
-    allowed_n = {norm(u) for u in allowed}
-    return sorted(u for u in found if norm(u) not in allowed_n)
+    """Any repo reference in the request that is not in the registry."""
+    allowed_full = {_norm_repo(u) for u in ALLOWED_URLS}
+    allowed_path = {_repo_path(u) for u in ALLOWED_URLS}
+
+    bad = set()
+    for raw in _URL_RE.findall(text):
+        if _norm_repo(raw) not in allowed_full:
+            bad.add(raw.rstrip("/"))
+    for raw in _SHORTHAND_RE.findall(text):
+        # A shorthand carries no host, so it can only be checked against owner/repo.
+        if _norm_repo(raw) not in allowed_path:
+            bad.add(raw.rstrip("/"))
+    return sorted(bad)
 
 
 SYSTEM_PROMPT = {
@@ -126,6 +182,121 @@ CARD_PATH = f"{BASE_PATH}{AGENT_CARD_WELL_KNOWN_PATH}"
 RPC_PATH = f"{BASE_PATH}{DEFAULT_RPC_URL}"
 
 
+# ---------------------------------------------------------------------------
+# Run summary
+#
+# Every report the skill writes ends with a fenced ```json block (see SKILL.md, step 10).
+# Extracting it here turns two days of prose in vuln-run.log into something you can count:
+# "how many CVEs did we close this month" becomes a jq one-liner over $STATE_DIR/runs/.
+# ---------------------------------------------------------------------------
+_SUMMARY_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
+
+
+def _save_run_summary(task_id: str, text: str) -> pathlib.Path | None:
+    """Persist the last parseable JSON summary block in the agent's final report."""
+    for raw in reversed(_SUMMARY_RE.findall(text)):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict) or "project" not in data:
+            continue
+        data.setdefault("task_id", task_id)
+        data.setdefault("finished_at", datetime.datetime.now().astimezone().isoformat())
+        # Registry keys are plain names, but never build a path out of unvalidated text.
+        project = re.sub(r"[^\w.-]", "_", str(data["project"]))[:64] or "unknown"
+        out = STATE_DIR / "runs" / f"{datetime.date.today():%Y%m%d}-{project}-{task_id[:8]}.json"
+        try:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            tmp = out.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=2) + "\n")
+            tmp.replace(out)
+            return out
+        except OSError as exc:
+            log.warning("could not write run summary: %r", exc)
+            return None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Task store
+#
+# InMemoryTaskStore loses every task when the process stops, so a container restart mid-run
+# left pollers looking at a task id the server no longer knew. The Claude session dies with
+# the process either way — what this buys is that the record survives, so a poller sees a
+# coherent task instead of a not-found, and finished runs stay queryable across restarts.
+#
+# It subclasses the SDK's internal impl deliberately: get()/list() carry owner-scoping and
+# filter semantics worth inheriting rather than reimplementing. That couples us to a private
+# name, so the import is guarded — if a future a2a-sdk moves it, we degrade to in-memory
+# with a warning rather than failing to boot.
+# ---------------------------------------------------------------------------
+def _build_task_store():
+    try:
+        from a2a.server.tasks.inmemory_task_store import _InMemoryTaskStoreImpl
+        from a2a.server.tasks.copying_task_store import CopyingTaskStoreAdapter
+        from a2a.types.a2a_pb2 import Task as _TaskProto
+    except Exception as exc:  # noqa: BLE001 — any import shape change lands here
+        log.warning("persistent task store unavailable (%r) — falling back to in-memory", exc)
+        return InMemoryTaskStore()
+
+    class _FileBackedTaskStore(_InMemoryTaskStoreImpl):
+        """In-memory semantics, mirrored to $STATE_DIR/tasks as protobuf."""
+
+        def __init__(self, directory: pathlib.Path):
+            super().__init__()
+            self._dir = directory
+            self._restore()
+
+        def _path(self, owner: str, task_id: str) -> pathlib.Path:
+            safe_owner = re.sub(r"[^\w.-]", "_", owner)[:64] or "_"
+            safe_id = re.sub(r"[^\w.-]", "_", task_id)[:128]
+            return self._dir / safe_owner / f"{safe_id}.pb"
+
+        def _restore(self) -> None:
+            if not self._dir.is_dir():
+                return
+            restored = 0
+            for f in self._dir.glob("*/*.pb"):
+                try:
+                    task = _TaskProto()
+                    task.ParseFromString(f.read_bytes())
+                    self.tasks.setdefault(f.parent.name, {})[task.id] = task
+                    restored += 1
+                except Exception as exc:  # noqa: BLE001 — a corrupt file must not block boot
+                    log.warning("skipping unreadable task file %s: %r", f, exc)
+            if restored:
+                print(f"[tasks] restored {restored} task(s) from {self._dir}", flush=True)
+
+        async def save(self, task, context) -> None:
+            await super().save(task, context)
+            owner = self.owner_resolver(context)
+            p = self._path(owner, task.id)
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                tmp = p.with_suffix(".tmp")
+                tmp.write_bytes(task.SerializeToString())
+                tmp.replace(p)
+            except OSError as exc:
+                # Durability is a nice-to-have; never fail a live run over it.
+                log.warning("could not persist task %s: %r", task.id, exc)
+
+        async def delete(self, task_id: str, context) -> None:
+            await super().delete(task_id, context)
+            self._path(self.owner_resolver(context), task_id).unlink(missing_ok=True)
+
+    return CopyingTaskStoreAdapter(_FileBackedTaskStore(STATE_DIR / "tasks"))
+
+
+# One Claude Code session at a time. Each run builds Docker images and runs a test suite on
+# a memory-constrained VM shared with other work; two at once is how the OOM killer gets
+# involved. The batch runner is serial, but nothing stopped a second caller from overlapping
+# with it — and ask.sh giving up on polling used to do exactly that.
+_RUN_LOCK = asyncio.Lock()
+# task_id -> the asyncio task running it, so cancel() has something to interrupt.
+_RUNNING: dict[str, asyncio.Task] = {}
+
+
 class ClaudeCodeExecutor(AgentExecutor):
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         # Task lifecycle rather than a bare reply message: a vuln-fix run takes far
@@ -157,6 +328,31 @@ class ClaudeCodeExecutor(AgentExecutor):
             )
             return
 
+        # Checked rather than awaited: a caller polling GetTask wants to know its request
+        # was turned away, not to have it silently queue behind a 20-minute run. Nothing
+        # awaits between the check and the acquire, so this cannot race.
+        if _RUN_LOCK.locked():
+            busy = ", ".join(_RUNNING) or "another task"
+            print(f"[task {context.task_id}] REJECTED: busy with {busy}", flush=True)
+            await updater.failed(
+                updater.new_agent_message([
+                    Part(text=(
+                        f"Busy: a run is already in progress ({busy}). This agent runs one "
+                        "session at a time — it builds images and runs test suites, and two "
+                        "at once exhausts the host. Retry when the current run finishes."
+                    ))
+                ])
+            )
+            return
+
+        async with _RUN_LOCK:
+            _RUNNING[context.task_id] = asyncio.current_task()
+            try:
+                await self._run(context, updater, prompt)
+            finally:
+                _RUNNING.pop(context.task_id, None)
+
+    async def _run(self, context: RequestContext, updater: TaskUpdater, prompt: str) -> None:
         options = ClaudeAgentOptions(
             cwd=WORKSPACE,
             system_prompt=SYSTEM_PROMPT,
@@ -182,6 +378,15 @@ class ClaudeCodeExecutor(AgentExecutor):
                                 TaskState.TASK_STATE_WORKING,
                                 message=updater.new_agent_message([Part(text=block.text)]),
                             )
+        except asyncio.CancelledError:
+            print(f"[task {context.task_id}] CANCELLED", flush=True)
+            await updater.cancel(
+                updater.new_agent_message([
+                    Part(text="Cancelled mid-run. Any clone or image this run created is "
+                              "still on disk; the next scheduled run reaps them.")
+                ])
+            )
+            raise
         except Exception as exc:
             print(f"[executor] failed: {exc!r}", flush=True)
             await updater.failed(updater.new_agent_message([Part(text=str(exc))]))
@@ -207,6 +412,10 @@ class ClaudeCodeExecutor(AgentExecutor):
         # Prefer the SDK's final result text over joined progress chunks.
         final_text = (result.result if result and result.result else "\n".join(chunks)) or "(no output)"
 
+        saved = _save_run_summary(context.task_id, final_text)
+        if saved:
+            print(f"[task {context.task_id}] summary -> {saved}", flush=True)
+
         if reason:
             print(f"[task {context.task_id}] FAILED: {reason}", flush=True)
             await updater.failed(
@@ -217,13 +426,30 @@ class ClaudeCodeExecutor(AgentExecutor):
             await updater.complete(updater.new_agent_message([Part(text=final_text)]))
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
-        raise NotImplementedError("cancel not supported")
+        """Interrupt a running session. Without this a runaway run could only be stopped
+        by restarting the container, which took every other task's state with it."""
+        running = _RUNNING.get(context.task_id)
+        if running is None:
+            updater = TaskUpdater(event_queue, context.task_id, context.context_id)
+            await updater.failed(
+                updater.new_agent_message([
+                    Part(text="Nothing to cancel: that task is not running on this process.")
+                ])
+            )
+            return
+        print(f"[task {context.task_id}] cancel requested", flush=True)
+        # execute() catches CancelledError and reports TASK_STATE_CANCELLED itself.
+        running.cancel()
 
 
 agent_card = AgentCard(
     name="Vuln Fix Agent",
-    description="Runs a Claude Code session in a project workspace and returns the result.",
-    version="1.0.0",
+    description=(
+        "Remediates Vanta-reported vulnerabilities in a fixed registry of repositories: "
+        "bumps the vulnerable dependency, regenerates the lockfile, verifies tests and the "
+        "rebuilt image, and opens a signed PR. Runs one session at a time."
+    ),
+    version="1.1.0",
     capabilities=AgentCapabilities(streaming=False),
     security_schemes={
         "bearer": SecurityScheme(
@@ -242,17 +468,23 @@ agent_card = AgentCard(
     ],
     skills=[
         AgentSkill(
-            id="code",
-            name="Code",
-            description="Read, write, and run code in the configured workspace.",
-            tags=["code", "files", "shell"],
+            id="vuln-fix",
+            name="Fix vulnerabilities",
+            description=(
+                "Remediate open Vanta findings for one registered project and open a PR. "
+                "Ask by project name, e.g. 'fix vulns in "
+                + (sorted(PROJECTS)[0] if PROJECTS else "<project>")
+                + "'. Registered projects: "
+                + (", ".join(sorted(PROJECTS)) or "(none)")
+            ),
+            tags=["security", "vulnerabilities", "cve", "dependencies", "pull-request"],
         )
     ],
 )
 
 handler = DefaultRequestHandler(
     agent_executor=ClaudeCodeExecutor(),
-    task_store=InMemoryTaskStore(),
+    task_store=_build_task_store(),
     agent_card=agent_card,
 )
 

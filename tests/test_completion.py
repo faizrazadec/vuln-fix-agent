@@ -1,8 +1,10 @@
-"""The executor must distinguish a finished run from a stalled/errored one.
+"""Executor semantics: what counts as finished, and what happens when one is already running.
 
 Regression test for the bug where an agent that stopped mid-work (ended its turn to
 await a notification, or hit the turn cap) was marked COMPLETED carrying a mid-work note.
-Run: uv run python test_completion.py
+Also covers the single-flight lock, which keeps a second caller from starting a Claude
+session — and a second docker build — on top of a run already in progress.
+Run: uv run python tests/test_completion.py
 """
 
 import asyncio
@@ -26,13 +28,14 @@ def R(**kw):
 
 class FakeUpdater:
     def __init__(self):
-        self.completed = self.failed_with = None
+        self.completed = self.failed_with = self.cancelled = None
     def new_agent_message(self, parts):
         return "".join(p.text for p in parts)
     async def start_work(self): ...
     async def update_status(self, *a, **k): ...
     async def complete(self, msg): self.completed = msg
     async def failed(self, msg): self.failed_with = msg
+    async def cancel(self, msg=None): self.cancelled = msg
 
 
 class _Ctx:
@@ -62,6 +65,43 @@ def drive(result_msg, blocks=("Progress so far:",)):
     return up
 
 
+def test_rejects_a_concurrent_run():
+    """A second SendMessage while a run is in flight must be refused, not queued.
+
+    Queueing would hand the caller a task that silently sits for 20 minutes; running it
+    would put two Claude sessions and two docker builds on a memory-constrained VM at once.
+    """
+    up = FakeUpdater()
+
+    async def scenario():
+        await main._RUN_LOCK.acquire()            # stand in for a run already going
+        main._RUNNING["busy-task"] = None
+        try:
+            orig = main.TaskUpdater
+            main.TaskUpdater = lambda *a, **k: up
+            try:
+                await main.ClaudeCodeExecutor().execute(_Ctx(), _Q())
+            finally:
+                main.TaskUpdater = orig
+        finally:
+            main._RUNNING.pop("busy-task", None)
+            main._RUN_LOCK.release()
+
+    asyncio.run(scenario())
+    assert up.completed is None, up.__dict__
+    assert up.failed_with and "Busy" in up.failed_with, up.__dict__
+    assert "busy-task" in up.failed_with, "should name what it is busy with"
+    print("concurrent run -> rejected, not queued ✓")
+
+
+def test_lock_is_released_after_a_run():
+    """A failed run must not leave the lock held — that would wedge every later request."""
+    drive(R(is_error=True, subtype="error_during_execution", errors=["boom"]))
+    assert not main._RUN_LOCK.locked(), "lock still held after a failed run"
+    assert not main._RUNNING, f"registry not cleaned: {main._RUNNING}"
+    print("lock and run registry released after a failed run ✓")
+
+
 if __name__ == "__main__":
     up = drive(R(result="DONE: PR opened"))
     assert up.completed == "DONE: PR opened" and up.failed_with is None, up.__dict__
@@ -82,5 +122,8 @@ if __name__ == "__main__":
     up = drive(None)
     assert up.completed is None and "without a ResultMessage" in up.failed_with, up.__dict__
     print("no result message -> failed ✓")
+
+    test_rejects_a_concurrent_run()
+    test_lock_is_released_after_a_run()
 
     print("ok")

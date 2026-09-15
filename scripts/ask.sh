@@ -7,6 +7,12 @@
 #
 # Sends returnImmediately so the run survives any HTTP timeout, then polls GetTask
 # until it finishes. Prints progress as the agent works.
+#
+# Exit codes matter to scripts/VulnFixAgent:
+#   0  the task COMPLETED
+#   2  the task FAILED — it ran and said so; the next project is safe to start
+#   1  we lost track of it (submit failed, or polling gave up) — it may STILL BE RUNNING,
+#      so a caller must not start another run on top of it
 set -e
 # scripts/ live one level below the repo root; operate from the root.
 cd "$(dirname "$0")/.."
@@ -79,5 +85,10 @@ if st in ("TASK_STATE_COMPLETED", "TASK_STATE_FAILED"):
   SEEN=$(sed -n 's/^__SEEN__ //p' /tmp/a2a.$$)
   STATE=$(sed -n 's/^__STATE__ //p' /tmp/a2a.$$)
   rm -f /tmp/a2a.$$
-  case "$STATE" in *COMPLETED|*FAILED) exit 0 ;; esac
+  # FAILED is a real answer, not a lost run: the task finished and reported why. Reporting
+  # it as 0 alongside COMPLETED hid every failed run from the batch runner's tally.
+  case "$STATE" in
+    *COMPLETED) exit 0 ;;
+    *FAILED|*CANCELLED|*REJECTED) exit 2 ;;
+  esac
 done

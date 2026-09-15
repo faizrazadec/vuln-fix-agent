@@ -1,16 +1,19 @@
 #!/bin/bash
 # Fire the vuln-fix agent for every registered project, one at a time.
-# Meant to be run on a schedule (see com.faizraza.vuln-fix-agent.vulnrun.plist).
+# Meant to be run on a schedule (see deploy/crontab).
 #
-#   ./VulnFixAgent          # run all projects serially
+#   ./VulnFixAgent               # run all projects serially
+#   ./VulnFixAgent --no-skip     # run every project even if Vanta reports nothing
+#   ./VulnFixAgent proj1 proj2   # just these projects
 #
 # Serial on purpose: the big repos (ai-hub, alkaline3) each have 400+ findings, so
-# running them concurrently would hammer Claude usage, CPU and Docker at once.
+# running them concurrently would hammer Claude usage, CPU and Docker at once. The
+# server enforces this too — it rejects a second concurrent SendMessage.
 set -u
 # Survive a closed terminal / ended SSH session (SIGHUP) — a manual run should not
 # die and orphan in-flight tasks. For a fully detached manual run:
 #   nohup ./scripts/VulnFixAgent >> vuln-run.log 2>&1 &
-# The launchd schedule has no controlling terminal, so it is immune already.
+# The cron schedule has no controlling terminal, so it is immune already.
 trap "" HUP
 
 # Operate from the repo root (scripts/ is one level down).
@@ -18,38 +21,165 @@ DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$DIR"
 
 LOCK="/tmp/vuln-fix-agent-run-all.lock"
+SVC=vuln-fix-agent
 LOG_TS() { date '+%Y-%m-%d %H:%M:%S'; }
+say() { echo "$(LOG_TS) $*"; }
+inside() { docker compose exec -T -u agent "$SVC" "$@"; }
+
+SKIP_EMPTY=1
+ARGS=()
+for a in "$@"; do
+  case "$a" in
+    --no-skip) SKIP_EMPTY=0 ;;
+    -*) echo "unknown flag: $a" >&2; exit 2 ;;
+    *) ARGS+=("$a") ;;
+  esac
+done
 
 # --- single-instance lock (mkdir is atomic) -------------------------------------
 # If a prior run is still going, skip rather than stack a second batch on top.
 if ! mkdir "$LOCK" 2>/dev/null; then
   # Steal a stale lock (>6h old) — a crashed run should not block forever.
   if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +360 2>/dev/null)" ]; then
-    echo "$(LOG_TS) stale lock >6h — reclaiming"; rmdir "$LOCK" 2>/dev/null; mkdir "$LOCK" 2>/dev/null
+    say "stale lock >6h — reclaiming"; rmdir "$LOCK" 2>/dev/null; mkdir "$LOCK" 2>/dev/null
   else
-    echo "$(LOG_TS) another run-all is active ($LOCK) — skipping this trigger"; exit 0
+    say "another run-all is active ($LOCK) — skipping this trigger"; exit 0
   fi
 fi
 trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 
+# --- log rotation ---------------------------------------------------------------
+# cron appends to vuln-run.log forever; every report the agent writes lands in it, so it
+# grows by ~80KB a run and nothing was ever trimming it. Rotate here rather than relying
+# on a root-owned /etc/logrotate.d entry, so the schedule stays self-contained.
+LOG="$DIR/vuln-run.log"
+MAX_BYTES=$(( 5 * 1024 * 1024 ))
+if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt "$MAX_BYTES" ]; then
+  rm -f "$LOG.3"
+  for n in 2 1; do [ -f "$LOG.$n" ] && mv "$LOG.$n" "$LOG.$((n + 1))"; done
+  cp "$LOG" "$LOG.1" && : > "$LOG"     # copy-truncate: cron's >> holds this fd open
+  say "rotated $(basename "$LOG") (kept 3 generations)"
+fi
+
 # --- the agent must be reachable ------------------------------------------------
 CARD="http://127.0.0.1:9999/.well-known/agent-card.json"
 if ! curl -sf -m 10 -o /dev/null "$CARD"; then
-  echo "$(LOG_TS) agent not reachable at $CARD — is the vuln-fix-agent container up? aborting"
+  say "agent not reachable at $CARD — is the $SVC container up? aborting"
   exit 1
 fi
 
+# --- reaper ---------------------------------------------------------------------
+# Cleanup used to live only in SKILL.md, i.e. it happened when the agent remembered to
+# do it. It did not: runs left 300MB+ verify images and week-old clones behind. Doing it
+# here makes it unconditional. The agent's half of the contract is now inverted — it
+# touches .vuln-fix-keep in a clone it wants preserved (the "a fix broke something" case)
+# rather than being trusted to delete the rest. Forgetting to keep costs a re-clone;
+# forgetting to delete used to cost the disk.
+reap() {
+  inside sh -s <<'REAP'
+set -u
+W="${WORKSPACE:-/home/agent/workspace}"
+freed=0
+for d in "$W"/*/; do
+  [ -d "$d" ] || continue
+  case "$(basename "$d")" in .*) continue ;; esac     # .pnpm-store and friends are caches
+  if [ -e "$d/.vuln-fix-keep" ]; then
+    # Kept for a human to inspect — but not forever.
+    if [ -n "$(find "$d" -maxdepth 0 -mtime +7 2>/dev/null)" ]; then
+      echo "  reap: dropping kept-but-stale clone $(basename "$d") (>7d)"
+      rm -rf "$d"
+    else
+      echo "  reap: KEEPING $(basename "$d") (.vuln-fix-keep — a fix broke something)"
+    fi
+    continue
+  fi
+  echo "  reap: removing clone $(basename "$d")"
+  rm -rf "$d" && freed=$((freed + 1))
+done
+# Images and containers the verification step built. Scoped to the namespace SKILL.md
+# mandates, so nothing else on this shared daemon is touched — never `system prune`.
+imgs=$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep '^vuln-fix-agent-verify/' || true)
+if [ -n "$imgs" ]; then
+  for i in $imgs; do
+    docker ps -aq --filter "ancestor=$i" 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1 || true
+    echo "  reap: removing image $i"
+    docker rmi -f "$i" >/dev/null 2>&1 || true
+  done
+fi
+docker image prune -f --filter "dangling=true" --filter "label=stage" >/dev/null 2>&1 || true
+echo "  reap: $freed clone dir(s) removed"
+REAP
+}
+
 # --- projects, in registry order ------------------------------------------------
-PROJECTS=$(python3 -c 'import json;print(*json.load(open("app/projects.json")))' 2>/dev/null)
+if [ ${#ARGS[@]} -gt 0 ]; then
+  PROJECTS="${ARGS[*]}"
+else
+  PROJECTS=$(python3 -c 'import json;print(*json.load(open("app/projects.json")))' 2>/dev/null)
+fi
 if [ -z "$PROJECTS" ]; then
-  echo "$(LOG_TS) no projects in app/projects.json — nothing to do"; exit 0
+  say "no projects in app/projects.json — nothing to do"; exit 0
 fi
 
-echo "$(LOG_TS) === run-all start: $PROJECTS ==="
+say "=== run-all start: $PROJECTS ==="
+ran=0; skipped=0; errored=0
 for proj in $PROJECTS; do
+  # --- pre-filter -----------------------------------------------------------------
+  # Most projects have no open findings on most days, and the agent's only way to learn
+  # that was to spawn a full Claude Code session (~60s and real quota) to shell out to
+  # vanta-findings. Ask here instead, and dispatch a session only when there is work.
+  if [ "$SKIP_EMPTY" = 1 ]; then
+    FINDINGS=$(inside vanta-findings "$proj" --json 2>/dev/null)
+    rc=$?
+    if [ "$rc" = 2 ]; then
+      # Auth or network: every remaining project would fail the same way.
+      say "!!! Vanta is unreachable or rejecting our credentials — aborting the batch"
+      exit 1
+    elif [ "$rc" != 0 ]; then
+      say "--- $proj: vanta-findings failed (exit $rc) — skipping, see \`vanta-findings --check-registry\`"
+      errored=$((errored + 1)); continue
+    fi
+    N=$(printf '%s' "$FINDINGS" | python3 -c 'import json,sys
+try: print(len(json.load(sys.stdin)))
+except Exception: print(-1)' 2>/dev/null)
+    if [ "$N" = 0 ]; then
+      say "--- $proj: no open findings — skipped (no session spawned)"
+      skipped=$((skipped + 1)); continue
+    elif [ "$N" = -1 ]; then
+      say "--- $proj: could not parse vanta-findings output — running the agent anyway"
+    else
+      say "--- $proj: $N open finding(s) — dispatching"
+    fi
+  fi
+
   start=$(date +%s)
-  echo "$(LOG_TS) --- $proj: starting ---"
+  say "--- $proj: starting ---"
   scripts/ask.sh "fix vulns in $proj"       # blocks until this project's task completes
-  echo "$(LOG_TS) --- $proj: done in $(( $(date +%s) - start ))s ---"
+  rc=$?
+  say "--- $proj: done in $(( $(date +%s) - start ))s (exit $rc) ---"
+  reap
+
+  # ask.sh exit 1 means we LOST TRACK of the task — it is very likely still running in the
+  # container. Continuing would start the next project on top of it: two Claude sessions,
+  # two docker builds, and the OOM killer. Stop the batch instead.
+  # Exit 2 is a task that finished and reported failure; that is one project's problem,
+  # not the batch's, so note it and carry on.
+  if [ "$rc" = 1 ]; then
+    say "!!! ask.sh lost track of $proj — the run may still be in flight. Aborting the"
+    say "!!! batch rather than starting another project on top of it."
+    errored=$((errored + 1))
+    exit 1
+  elif [ "$rc" != 0 ]; then
+    say "--- $proj: task reported FAILED"
+    errored=$((errored + 1))
+    continue
+  fi
+  ran=$((ran + 1))
 done
-echo "$(LOG_TS) === run-all finished ==="
+
+# Reap once more at the end. The per-project reap only fires for projects that actually
+# ran, so a batch where everything was pre-filtered out would never clean up leftovers
+# from an earlier run that died before its own reap.
+reap
+
+say "=== run-all finished: $ran ran, $skipped skipped (no findings), $errored errored ==="

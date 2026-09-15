@@ -59,8 +59,12 @@ if [ -n "$SSH_AUTH_KEY" ] && [ -f "$SSHDIR/$SSH_AUTH_KEY" ]; then
 fi
 
 # $CLAUDE_CONFIG_DIR is a named volume, so image content does not appear there on
-# rebuild — copy skills in on every start instead.
+# rebuild — copy skills in on every start instead. Clear the directory first: cp -R only
+# ever adds, so a renamed or deleted skill used to linger in the volume forever and stay
+# loadable (the same trap load-keys.sh has with rotated keys). The image is the source of
+# truth; nothing else should ever write here.
 if [ -d /app/skills ]; then
+  rm -rf "$CLAUDE_CONFIG_DIR/skills"
   mkdir -p "$CLAUDE_CONFIG_DIR/skills"
   cp -R /app/skills/. "$CLAUDE_CONFIG_DIR/skills/"
   echo "[entrypoint] skills: $(ls "$CLAUDE_CONFIG_DIR/skills" | tr '\n' ' ')"

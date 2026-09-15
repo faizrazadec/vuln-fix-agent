@@ -3,6 +3,7 @@
 
     vanta-findings snapdev-backend            # human-readable
     vanta-findings snapdev-backend --json     # machine-readable, for the agent
+    vanta-findings --check-registry           # do every project's assets resolve in Vanta?
 
 Uses the Vanta REST API (OAuth2 client credentials), not the browser session — a
 scraped `connect.sid` dies on logout AND the GraphQL payload carries a timestamped
@@ -11,7 +12,12 @@ scraped `connect.sid` dies on logout AND the GraphQL payload carries a timestamp
 Filters come from projects.json, never from the caller, so this cannot be pointed at
 findings outside the registry.
 
-Exit codes: 2 auth/network, 3 unknown project, 4 config missing.
+Exit codes: 0 success (INCLUDING a genuinely empty finding list), 2 auth/network,
+3 unknown project or no asset in scope resolves, 4 config missing.
+
+Exit 0 always prints a JSON array in --json mode, so the caller can tell "no open
+findings" from "the lookup failed" — previously a stale asset name aborted the whole
+project with empty stdout and the agent could not distinguish the two.
 """
 
 import json
@@ -108,7 +114,26 @@ def resolve_assets(token, names):
         cursor = info.get("endCursor")
     missing = wanted - {n.lower() for n in ids}
     if missing:
-        die(f"asset(s) not found in Vanta: {', '.join(sorted(missing))}", 3)
+        # Warn, do not abort. A single renamed or retired asset used to take the whole
+        # project down with it (exit 3, empty stdout), so every run on that project was a
+        # no-op nobody could tell apart from "clean". Findings for the assets that DO
+        # resolve are still worth having; the warning goes to stderr so --json stays clean.
+        print(
+            f"WARNING: {len(missing)} of {len(wanted)} assets in scope are not in Vanta: "
+            + ", ".join(sorted(missing))
+            + "\n         Findings below cover only the assets that resolved. Fix the "
+            "'vanta.assets' entry in projects.json, or re-register the asset in Vanta.",
+            file=sys.stderr,
+        )
+    if not ids:
+        # Nothing resolved at all: any list we returned would be silently scoped to
+        # everything, which is worse than stopping.
+        die(
+            "none of this project's assets resolve in Vanta: "
+            + ", ".join(sorted(wanted))
+            + " — check the 'vanta.assets' entry in projects.json",
+            3,
+        )
     return list(ids.values())
 
 
@@ -137,6 +162,57 @@ def fetch(token, params):
             return out
 
 
+def all_asset_names(token):
+    """Every vulnerable-asset name Vanta knows, lowercased -> as spelled."""
+    names = {}
+    cursor = None
+    while True:
+        q = {"pageSize": 100}
+        if cursor:
+            q["pageCursor"] = cursor
+        url = f"{BASE}/v1/vulnerable-assets?" + urllib.parse.urlencode(q)
+        try:
+            body = get_json(url, token)
+        except urllib.error.HTTPError as e:
+            die(f"could not list assets (HTTP {e.code})", 2)
+        res = body.get("results", {})
+        for a in res.get("data", []):
+            names[a.get("name", "").lower()] = a.get("name", "")
+        info = res.get("pageInfo", {})
+        if not info.get("hasNextPage"):
+            return names
+        cursor = info.get("endCursor")
+
+
+def check_registry(projects):
+    """Report every projects.json asset name that Vanta does not know.
+
+    A stale name here is invisible in normal operation — the project just quietly
+    produces fewer findings — so it needs a command that goes looking for it. Run this
+    after editing projects.json. Exit 1 if anything is stale.
+    """
+    known = all_asset_names(get_token())
+    stale = 0
+    for name, cfg in sorted(projects.items()):
+        assets = (cfg.get("vanta") or {}).get("assets") or []
+        if not assets:
+            print(f"  {name:24} (no asset filter — all assets)")
+            continue
+        missing = [a for a in assets if a.lower() not in known]
+        stale += len(missing)
+        mark = "FAIL" if missing else "ok  "
+        print(f"  {mark} {name:24} {len(assets) - len(missing)}/{len(assets)} resolve")
+        for a in missing:
+            print(f"         missing in Vanta: {a}")
+    if stale:
+        print(f"\n{stale} stale asset name(s). Re-register them in Vanta or correct "
+              f"projects.json — findings for those assets are silently missing.",
+              file=sys.stderr)
+        return 1
+    print(f"\nall {len(projects)} projects resolve cleanly")
+    return 0
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     as_json = "--json" in sys.argv
@@ -145,8 +221,12 @@ def main():
         die(f"missing {REGISTRY}", 4)
     projects = json.loads(REGISTRY.read_text())
 
+    if "--check-registry" in sys.argv:
+        sys.exit(check_registry(projects))
+
     if not args:
-        die(f"usage: vanta-findings <project> [--json]\nknown: {', '.join(projects)}")
+        die(f"usage: vanta-findings <project> [--json] | vanta-findings --check-registry"
+            f"\nknown: {', '.join(projects)}")
     name = args[0]
     if name not in projects:
         die(f"'{name}' is not a registered project. Known: {', '.join(projects)}", 3)

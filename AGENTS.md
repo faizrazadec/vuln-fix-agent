@@ -10,7 +10,7 @@ a rename, a new volume, a changed schedule, a rotated key. A stale entry here is
 than no entry, because it will be trusted. Facts the repo already records (code
 structure, module layout) do not belong here.
 
-## Current state — verified 2026-09-10
+## Current state — verified 2026-09-15
 
 | Thing | Value |
 | --- | --- |
@@ -20,11 +20,11 @@ structure, module layout) do not belong here.
 | Network | `vuln-fix-agent-net` |
 | Endpoint | `http://127.0.0.1:9999` — host-only, nothing fronts it |
 | Agent card name | `Vuln Fix Agent` (`app/main.py`) |
-| Volumes | `vuln-fix-agent_{claude-auth,workspace,state,ssh-keys}` |
+| Volumes | `vuln-fix-agent_{claude-auth,workspace,state,trivy-cache,ssh-keys}` |
 | GitHub repo | `git@github.com:faizrazadec/vuln-fix-agent.git` |
 | SSH key | `~/.ssh/vuln-fix-agent` (+ `.pub`), passphrase in `.env` |
 | Key fingerprint | `SHA256:kJoYmMYPZeCvEMEnH5QlKURcVqJuIT/gJ45wyyeKmOc` |
-| Scheduled run | user crontab, `0 3 * * 1-5`, logs to `/opt/vuln-fix-agent/vuln-run.log` |
+| Scheduled run | user crontab, `0 3 * * 1-5`, logs to `/opt/vuln-fix-agent/vuln-run.log` (self-rotating at 5MB, 3 generations; see `deploy/crontab`) |
 
 The Claude subscription login is live in `vuln-fix-agent_claude-auth`
 (`.credentials.json` + `.claude.json`). Do not delete that volume — see CLAUDE.md.
@@ -63,7 +63,15 @@ These cost real time to rediscover. They are about running the stack, not about 
   and the `ssh-keys` volume, and no source file at all.
 - **`load-keys.sh` copies but never deletes.** Renaming or rotating a key leaves the old
   one in the volume, from where `entrypoint.sh` copies *everything* into `~/.ssh`. Wipe
-  the volume's contents first, then re-run the script.
+  the volume's contents first, then re-run the script. (The skills directory had the same
+  bug and no longer does — `entrypoint.sh` now clears it before copying.)
+- **`app/projects.json` is bind-mounted, so a registry edit needs only a restart**, not a
+  rebuild. It is still `COPY`d into the image as a fallback, so if you ever remove the
+  mount the container silently falls back to whatever was baked in at build time.
+- **Anything you leave under `/home/agent/workspace` gets reaped.** `VulnFixAgent` clears
+  it after every project. To keep a clone, `touch .vuln-fix-keep` inside it — that buys
+  7 days. Same for images: only the `vuln-fix-agent-verify/*` namespace is reaped, and
+  only that namespace is cleaned up, so an image tagged elsewhere lives forever.
 
 ## Health check
 
@@ -74,11 +82,29 @@ docker compose logs --tail 20 vuln-fix-agent        # expect "ssh-agent holds 1 
 docker compose exec -u agent vuln-fix-agent \
   sh -c 'ls ~/.claude/.credentials.json'            # login survived
 uv run python tests/test_protocol.py                # offline, free, five checks
+uv run python tests/test_bin.py                     # offline, the app/bin exit-code contract
+docker compose exec -u agent vuln-fix-agent \
+  vanta-findings --check-registry                   # stale asset names in projects.json
+docker compose exec -u agent vuln-fix-agent \
+  sh -c 'ls /home/agent/workspace'                  # should be empty but for .pnpm-store
+docker images --format '{{.Repository}}' | grep vuln-fix-agent-verify   # should be empty
 ```
 
 ## Change log
 
 Newest first. One line per infrastructure change, with the date.
+
+- **2026-09-15** — Audit fixes. Reaping moved out of SKILL.md into `VulnFixAgent` (runs had
+  been leaving 300MB+ verify images and week-old clones behind). Batch runner now
+  pre-filters on `vanta-findings` and skips projects with no open findings, so a nightly
+  run spawns a session only where there is work; it also aborts rather than starting a
+  project on top of one whose poller gave up. Server rejects concurrent runs and implements
+  `cancel()`. New `trivy-cache` volume (the 1.3GB DB was in the container's writable layer
+  and re-downloaded on every rebuild). `app/projects.json` bind-mounted. npm, claude-code
+  and trivy pinned in the Dockerfile. Launchd plist deleted — it was a Mac artifact on a
+  Linux host — and replaced by `deploy/crontab`, matching what the crontab already ran.
+  `dynamic-regulations` has two stale Vanta asset names (`vanta-findings --check-registry`);
+  it no longer aborts the whole project, but the names still need fixing in Vanta.
 
 - **2026-09-10** — SSH key renamed `a2claude_agent` → `vuln-fix-agent`; key material
   untouched (same fingerprint), so both GitHub registrations still match. Container and
@@ -91,6 +117,18 @@ Newest first. One line per infrastructure change, with the date.
   stack is now local-only and `PUBLIC_URL` is empty on purpose.
 
 ## Known loose ends
+
+- **Slack delivery goes through the claude.ai MCP connector, by design** — `SLACK_WEBHOOK_URL`
+  is deliberately empty and the `slack-notify` CLI is only a last-resort fallback that will
+  report exit 4. As of the 2026-09-14/15 runs the connector authenticated but
+  `slack_search_channels` could not resolve `#development-and-pr-reviews`, so PR and
+  unfixable-finding notices were not delivered (see `vuln-run.log`). The agent reports this
+  honestly rather than assuming delivery. Fix by inviting the connector's account to the
+  channel; nothing in this repo needs to change.
+- **`dynamic-regulations` has two stale Vanta asset names.** `vanta-findings
+  --check-registry` names them. Findings for the one asset that resolves are collected
+  normally now, but the other two contribute nothing until they are re-registered in Vanta
+  or removed from `projects.json`.
 
 - The pre-rename `a2claude_*` volumes and the `a2claude:latest` image tag still exist as a
   rollback path. Safe to delete once the current stack has run a full cycle; nothing

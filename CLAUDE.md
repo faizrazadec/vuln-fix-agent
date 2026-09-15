@@ -25,7 +25,7 @@ app/       what runs inside the container: main.py, entrypoint.sh, bin/ (agent
            and projects.json (the registry — gitignored; projects.example.json is the template)
 scripts/   host-side ops: ask.sh (fire one run), VulnFixAgent (the scheduled batch runner),
            load-keys.sh (load SSH keys into the volume)
-deploy/    the launchd plist for the weekday schedule
+deploy/    the crontab entry for the weekday schedule
 tests/     assert-based scripts (add app/ to sys.path, then import main)
 Dockerfile, compose.yml, pyproject.toml, uv.lock, .env  — at the root
 ```
@@ -36,8 +36,14 @@ Dockerfile, compose.yml, pyproject.toml, uv.lock, .env  — at the root
 uv sync                                # install deps (Python >=3.14)
 
 uv run python tests/test_protocol.py         # protocol tests — offline, free, stubs the executor
+uv run python tests/test_registry.py         # the repo allowlist actually blocks
+uv run python tests/test_completion.py       # a stalled run is not reported as COMPLETED
+uv run python tests/test_bin.py              # the app/bin exit-code contract SKILL.md relies on
 uv run python tests/test_smoke.py            # end-to-end — spawns real Claude Code, BURNS QUOTA
 uv run python tests/test_smoke.py --card-only  # agent-card assertions only, no quota
+
+docker compose exec -u agent vuln-fix-agent vanta-findings --check-registry  # stale asset names
+./scripts/VulnFixAgent <project>             # one project; --no-skip to ignore the pre-filter
 
 docker compose up -d --build
 docker compose logs -f vuln-fix-agent
@@ -66,6 +72,22 @@ Three decisions there are load-bearing and easy to break:
   `test_protocol.py` sets `BASE_PATH=/a2a` specifically to keep this honest.
 - **Auth middleware.** Everything is bearer-gated except the agent card, which stays public
   so callers can discover the endpoint. Comparison uses `secrets.compare_digest`.
+- **One session at a time.** `_RUN_LOCK` rejects a second concurrent `SendMessage` outright
+  rather than queueing it. Each run builds images and runs a test suite on a shared,
+  memory-constrained VM; two at once is how the OOM killer gets involved. The batch runner
+  is serial, but a poller that gave up used to let the next project start on top of a run
+  that was still going.
+- **The repo allowlist is a guard rail, not a sandbox.** `_disallowed_urls` catches a caller
+  who *names* an unregistered repo — in any of the spellings that matter (`git@`, scheme,
+  scheme-less, and `clone owner/repo` shorthand; all three of the latter used to slip
+  through). Under `bypassPermissions` a determined prompt can still reach the network by
+  other means. The real boundary is the 127.0.0.1 bind plus the bearer token.
+- **Run summaries.** The skill ends every report with a fenced ```json block; the executor
+  extracts the last one into `$STATE_DIR/runs/`. Without it the only record of a run is
+  prose in `vuln-run.log`, which cannot answer "how many CVEs did we close this month".
+- **Task store.** File-backed under `$STATE_DIR/tasks`, so a restart no longer leaves a
+  poller holding an id the server has never heard of. It subclasses a private a2a-sdk class
+  to inherit owner-scoped `get`/`list`; the import is guarded and degrades to in-memory.
 
 **`app/skills/vuln-fix/SKILL.md`** is the vulnerability-fix pipeline expressed as
 *instructions*, not orchestration code — Claude Code already has the agent loop. It is
@@ -99,5 +121,16 @@ needs the REST API.
 - `permission_mode="bypassPermissions"` trusts every caller. It is marked with a `ponytail:`
   comment in `main.py`. Anything beyond a private network needs `permission_mode="default"`
   plus a `can_use_tool` callback.
-- `InMemoryTaskStore` means task state dies with the process. A restart mid-run loses the task.
-- `cancel()` raises `NotImplementedError`.
+- A restart still kills the running Claude session — the task *record* survives now, the
+  work does not. There is no resume.
+- **Cleanup is the runner's job, not the agent's.** `VulnFixAgent` reaps the workspace and
+  the `vuln-fix-agent-verify/*` image namespace after every project. The skill's contract is
+  inverted accordingly: it marks a clone it wants kept with `.vuln-fix-keep`. An image
+  tagged outside that namespace is invisible to the reaper and will accumulate.
+- **The `notified` ledger is version-keyed.** `vuln-ledger notified <CVE> --fixed-version V`
+  exits 1 — i.e. stop suppressing — when V differs from what was recorded, or when the entry
+  is older than `LEDGER_NOTIFY_TTL_DAYS` (90). Omit `--fixed-version` and a CVE that gets
+  patched upstream stays suppressed forever, which is the bug it was added for.
+- **`vanta-findings` exit 0 with `[]` means no findings.** A stale asset name is a stderr
+  warning, not a failure — it used to abort the whole project with empty stdout, which the
+  agent could not tell apart from a clean result. `--check-registry` lists stale names.

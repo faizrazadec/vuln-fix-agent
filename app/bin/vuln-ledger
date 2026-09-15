@@ -7,64 +7,190 @@ from git and gh at run time (nothing to keep in sync). This ledger records only:
   * notified   — unfixable CVEs already Slacked, so the owner isn't re-pinged daily
   * resolved   — CVEs an opened PR addressed, as an audit trail
 
-    vuln-ledger <project>                          # print the whole ledger as JSON
-    vuln-ledger <project> notified <CVE>           # exit 0 if already notified, else 1
-    vuln-ledger <project> add-notified <CVE>       # record an unfixable notification
-    vuln-ledger <project> add-resolved <CVE> <url> # record a CVE fixed by a PR
+    vuln-ledger <project>                                  # print the whole ledger as JSON
+    vuln-ledger <project> notified <CVE> [--fixed-version V]
+                                                           # exit 0 = stay quiet, 1 = notify
+    vuln-ledger <project> add-notified <CVE> [--fixed-version V] [--reason "..."]
+    vuln-ledger <project> add-resolved <CVE> <pr-url>
+
+`notified` is a suppression check, and suppression that never lifts is a bug: a CVE
+recorded as unfixable stays suppressed even after upstream ships a patch. So pass
+`--fixed-version` (Vanta's `fixedVersion`, or "none" when there is none) on BOTH
+add-notified and notified. The suppression lifts — exit 1, notify again — when:
+
+  * the fixed version changed since we recorded it (a patch now exists, or a different
+    one does), or
+  * the entry is older than LEDGER_NOTIFY_TTL_DAYS (default 90), so a finding nobody
+    ever acted on resurfaces instead of being buried forever.
 
 Stored under $STATE_DIR (a persisted volume), one file per project.
+
+Exit codes: 0 / 1 as described for `notified`; 2 usage error; 3 bad project name.
 """
 
 import datetime
 import json
 import os
 import pathlib
+import re
 import sys
 
 STATE_DIR = pathlib.Path(os.environ.get("STATE_DIR", "/home/agent/state"))
+TTL_DAYS = int(os.environ.get("LEDGER_NOTIFY_TTL_DAYS", "90"))
+
+# A project name becomes a filename, so it may never contain a path separator. The agent
+# supplies it, and the agent runs with bypassPermissions — this is cheap, so do it anyway.
+_SAFE_NAME = re.compile(r"^[\w.-]{1,64}$")
+
+
+def die(msg, code=2):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
 
 
 def today():
     return datetime.date.today().isoformat()
 
 
+def ledger_path(project):
+    if not _SAFE_NAME.match(project) or project in (".", ".."):
+        die(f"invalid project name: {project!r} (letters, digits, . _ - only)", 3)
+    return STATE_DIR / f"{project}.json"
+
+
 def load(project):
-    f = STATE_DIR / f"{project}.json"
+    f = ledger_path(project)
+    data = {}
     if f.exists():
-        return json.loads(f.read_text())
-    return {"notified": {}, "resolved": {}}
+        try:
+            data = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            die(f"ledger for {project} is unreadable ({e}) — fix or delete {f}", 2)
+    if not isinstance(data, dict):
+        die(f"ledger for {project} is not a JSON object — fix or delete {f}", 2)
+    # .get with defaults, not [""]: a hand-edited or older file missing a key used to
+    # raise KeyError, and a crashed add-notified means the owner gets re-pinged daily.
+    return {
+        "notified": data.get("notified") or {},
+        "resolved": data.get("resolved") or {},
+    }
 
 
 def save(project, data):
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    (STATE_DIR / f"{project}.json").write_text(json.dumps(data, indent=2) + "\n")
+    f = ledger_path(project)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    # Write-then-rename: a crash mid-write must not leave a truncated ledger behind,
+    # because an unreadable ledger re-notifies every CVE in it.
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    tmp.replace(f)
+
+
+def normalise(entry):
+    """Entries were plain date strings before fixed-version tracking existed."""
+    if isinstance(entry, str):
+        return {"date": entry, "fixed_version": None}
+    if isinstance(entry, dict):
+        return {"date": entry.get("date"), "fixed_version": entry.get("fixed_version"),
+                "reason": entry.get("reason")}
+    return {"date": None, "fixed_version": None}
+
+
+def clean_version(v):
+    """Vanta spells "no patch exists" several ways; they all mean the same thing."""
+    if v is None:
+        return None
+    v = str(v).strip()
+    return None if v.lower() in ("", "none", "null", "notavailable", "n/a", "-") else v
+
+
+def stale(entry):
+    """True once an entry is older than the TTL, so it stops suppressing."""
+    if TTL_DAYS <= 0 or not entry.get("date"):
+        return False
+    try:
+        age = datetime.date.today() - datetime.date.fromisoformat(entry["date"])
+    except ValueError:
+        return False
+    return age.days > TTL_DAYS
+
+
+def opt(args, name):
+    """Pull `--name value` out of the argument list, returning the value."""
+    if name not in args:
+        return None
+    i = args.index(name)
+    if i + 1 >= len(args):
+        die(f"{name} needs a value")
+    value = args[i + 1]
+    del args[i:i + 2]
+    return value
 
 
 def main():
-    a = sys.argv[1:]
-    if not a:
-        sys.exit("usage: vuln-ledger <project> [notified|add-notified|add-resolved] ...")
-    project = a[0]
+    argv = sys.argv[1:]
+    fixed_version = clean_version(opt(argv, "--fixed-version"))
+    reason = opt(argv, "--reason")
+
+    if not argv:
+        die("usage: vuln-ledger <project> [notified|add-notified|add-resolved] ...")
+    project = argv[0]
     data = load(project)
 
-    if len(a) == 1:
-        print(json.dumps(data, indent=2))
+    if len(argv) == 1:
+        print(json.dumps(data, indent=2, sort_keys=True))
         return
 
-    cmd = a[1]
+    cmd = argv[1]
+
     if cmd == "notified":
-        # exit 0 = already notified (caller should skip re-Slacking), 1 = not yet
-        sys.exit(0 if a[2] in data["notified"] else 1)
-    elif cmd == "add-notified":
-        data["notified"].setdefault(a[2], today())
+        if len(argv) < 3:
+            die("usage: vuln-ledger <project> notified <CVE> [--fixed-version V]")
+        cve = argv[2]
+        entry = data["notified"].get(cve)
+        if entry is None:
+            sys.exit(1)  # never notified — go notify
+        entry = normalise(entry)
+        if clean_version(entry.get("fixed_version")) != fixed_version:
+            # A patch appeared (or changed) since we called this unfixable. Stop suppressing.
+            print(
+                f"{cve}: fixed version changed since {entry.get('date')} "
+                f"({entry.get('fixed_version') or 'none'} -> {fixed_version or 'none'}) "
+                "— re-check and re-notify",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if stale(entry):
+            print(f"{cve}: notified {entry.get('date')}, older than {TTL_DAYS}d — "
+                  "resurfacing", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)  # already notified, nothing changed — stay quiet
+
+    if cmd == "add-notified":
+        if len(argv) < 3:
+            die("usage: vuln-ledger <project> add-notified <CVE> [--fixed-version V] "
+                "[--reason \"...\"]")
+        cve = argv[2]
+        entry = {"date": today(), "fixed_version": fixed_version}
+        if reason:
+            entry["reason"] = reason
+        data["notified"][cve] = entry
         save(project, data)
-        print(f"recorded notified: {a[2]}")
-    elif cmd == "add-resolved":
-        data["resolved"][a[2]] = {"pr": a[3], "date": today()}
+        print(f"recorded notified: {cve} (fixed_version={fixed_version or 'none'})")
+        return
+
+    if cmd == "add-resolved":
+        if len(argv) < 4:
+            die("usage: vuln-ledger <project> add-resolved <CVE> <pr-url>")
+        cve, url = argv[2], argv[3]
+        data["resolved"][cve] = {"pr": url, "date": today()}
+        # A CVE that just landed in a PR is no longer an unfixable one to stay quiet about.
+        data["notified"].pop(cve, None)
         save(project, data)
-        print(f"recorded resolved: {a[2]} -> {a[3]}")
-    else:
-        sys.exit(f"unknown command: {cmd}")
+        print(f"recorded resolved: {cve} -> {url}")
+        return
+
+    die(f"unknown command: {cmd}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,17 @@
+# Weekday 03:00 batch run of every registered project.
+#
+# Install:  crontab -e   and paste the SHELL/PATH/MAILTO lines plus the job below.
+# Verify:   crontab -l
+#
+# This replaces the launchd plist that used to live here. That plist was written for a Mac
+# (`~/Library/LaunchAgents`, a /Users/... path) and this host is Linux — it had not been the
+# real schedule for some time, while CLAUDE.md still described it as one. cron is what
+# actually runs the batch.
+#
+# VulnFixAgent rotates vuln-run.log itself, takes a single-instance lock, and aborts the
+# batch rather than overlapping two runs, so it is safe to fire unconditionally.
+
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+MAILTO=""
+0 3 * * 1-5 cd /opt/vuln-fix-agent && ./scripts/VulnFixAgent >> /opt/vuln-fix-agent/vuln-run.log 2>&1

@@ -33,11 +33,16 @@ runs before (processes vanish with no summary). So:
 1. **Get the finding list.** `vanta-findings <project> --json`. This is the authoritative
    list — the same findings Vanta tracks for this project's assets. Trivy is only for
    verifying a fix, never the source of truth. If it exits non-zero, report why and stop.
+   **Exit 0 with `[]` means genuinely no open findings** — that is an answer, not a
+   failure, so do not go hunting for a second opinion. A `WARNING: N of M assets in scope
+   are not in Vanta` on stderr with exit 0 is also not a failure: the findings you got are
+   real and cover the assets that resolved. Carry on, and name the stale asset in your
+   final report so it gets fixed (`vanta-findings --check-registry` lists them all).
 
 2. **Clone** into a fresh dir under `$WORKSPACE` (repo name + timestamp, so runs never
    collide). Use the SSH URL. A fresh clone every run is deliberate — it always gets the
-   latest base branch, no stale checkout. First, prune stale clones as a backstop against
-   a missed cleanup: `find "$WORKSPACE" -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf {} +`.
+   latest base branch, no stale checkout. Stale clones are reaped for you between projects
+   (step 9), so there is nothing to prune first.
 
 3. **Pick the base branch.** If the project registry in your system prompt gives this
    project a `base:` branch, that is authoritative — use exactly that branch as the base,
@@ -77,9 +82,13 @@ runs before (processes vanish with no summary). So:
       skip a finding because a Dependabot PR exists for it (they routinely target the wrong
       branch or skip the lockfile). Fix every finding yourself, in your PR.
 
-   c. **Already notified unfixable** — for an unfixable finding (5a), run
-      `vuln-ledger <project> notified <CVE>`; exit 0 means you already Slacked it on a prior
-      run, so **do not Slack again**. Collect into an "unfixable, already notified" list.
+   c. **Already notified unfixable** — for an unfixable finding (6a), run
+      `vuln-ledger <project> notified <CVE> --fixed-version <fixedVersion|none>`, passing
+      the version Vanta reports *right now*. Exit 0 means nothing has changed since you
+      Slacked it, so **do not Slack again** — collect it into an "unfixable, already
+      notified" list. **Exit 1 means the suppression has lifted** and the finding is live
+      work again: either a patch appeared since (the ledger prints the before/after on
+      stderr) or the entry aged out. Re-evaluate from scratch — if it is fixable now, fix it.
 
    Only findings that survive triage — genuinely new, fixable, no open PR — go on to the
    work below. If nothing survives, skip straight to the report: clone was cheap, and you
@@ -119,7 +128,9 @@ runs before (processes vanish with no summary). So:
       it explains WHY the fix is unreachable. And **list every finding individually** by its
       Vanta identifier — never a rollup like "10 go/stdlib CVEs (incl. …)", which leaves the
       unnamed ones un-actionable.
-      Then `vuln-ledger <project> add-notified <CVE>` so future runs stay quiet about it.
+      Then record it so future runs stay quiet — **with the version Vanta currently
+      reports**, so the quiet ends by itself the day a patch ships:
+      `vuln-ledger <project> add-notified <CVE> --fixed-version <fixedVersion|none> --reason "<why the fix is unreachable>"`
       Move on. (Triage step 4c already filtered out ones you notified on a prior run.)
 
    b. **Fixable:** bump the dependency to `fixedVersion`, then **regenerate the lockfile the
@@ -211,7 +222,9 @@ runs before (processes vanish with no summary). So:
    (notify like an unfixable finding, 6a wording adapted: "<package> <CVE>: the only
    available fix (<version>) introduces new <severity> findings via <vendored/transitive
    dep> — a net regression, not applied. Please deactivate it in Vanta or review manually."
-   then `vuln-ledger <project> add-notified <CVE>`). Keep the clean bumps.
+   then `vuln-ledger <project> add-notified <CVE> --fixed-version <the regressing version>
+   --reason "net regression"` — recording the version that regressed means the next version
+   to ship lifts the suppression by itself). Keep the clean bumps.
 
 8. **Decide, per the verification result:**
 
@@ -246,28 +259,53 @@ runs before (processes vanish with no summary). So:
      If some fixes were clean and only one broke, you may open a PR for the clean ones and
      message about the one that broke; make clear in both which is which.
 
-9. **Clean up — the clone AND the Docker artifacts you created.** A run that skips this
-   leaves stopped containers, built images, and clone dirs piling up on a shared daemon.
+9. **Clean up — say what to KEEP, not what to delete.** The batch runner reaps the
+   workspace and the `vuln-fix-agent-verify/*` image namespace after every project,
+   unconditionally. You do not have to remember to tidy up, and you must not rely on the
+   reaper skipping anything you did not mark.
 
-   - **Docker (always, every outcome).** Remove the images you built for this project and any
-     containers from them — scoped to your `vuln-fix-agent-verify/<project>` namespace so nothing
-     else is touched:
-     ```
-     docker ps  -aq --filter "ancestor=vuln-fix-agent-verify/<project>:base"  --filter "ancestor=vuln-fix-agent-verify/<project>:fixed" | xargs -r docker rm -f
-     docker images -q "vuln-fix-agent-verify/<project>" | xargs -r docker rmi -f
-     docker image prune -f --filter "dangling=true" --filter "label=stage"  # only your build's dangling layers
-     ```
-     (If you followed the `--rm` rule there are no containers to remove — this is the backstop.)
-     NEVER `docker system prune`, `container prune`, or `image prune -a` — the daemon is shared.
-   - **Clone dir.**
-     - **Success, skip, or nothing-to-do** — delete the timestamped dir you created under
-       `$WORKSPACE`. Prefer `rm -rf "<dir>"`; if that is refused in this headless session
-       (the destructive-command guard can fire even here), fall back to
-       `find "<dir>" -mindepth 0 -delete`, which the guard does not flag. The PR is on GitHub
-       and the ledger has the outcome; nothing local is worth keeping.
-     - **A fix broke something** (the 8b case) — **keep** the clone so a human can inspect it.
-       Say so in your final report and Slack message, and include the clone's path.
-   Only ever remove the specific dir you created under `$WORKSPACE`, nothing else.
+   - **If a fix broke something** (the 8b case) and a human needs to inspect the clone,
+     mark it: `touch "<clone-dir>/.vuln-fix-keep"`. The reaper preserves marked clones for
+     7 days. Say in your final report and Slack message that you kept it, with its path.
+   - **Every other outcome** — do nothing. The clone and any `vuln-fix-agent-verify/*`
+     images you built are removed for you after the run.
+   - You may still delete your own clone early if you want the disk back sooner
+     (`rm -rf "<dir>"`, or `find "<dir>" -mindepth 0 -delete` if the destructive-command
+     guard fires). Never delete anything under `$WORKSPACE` that you did not create.
+   - Still `docker run --rm` anything you run, and still tag every image you build under
+     `vuln-fix-agent-verify/<project>` — the reaper finds images by that namespace, so an
+     image tagged outside it survives and accumulates. NEVER `docker system prune`,
+     `container prune`, or `image prune -a`: the daemon is shared with other stacks.
+
+10. **End your report with a machine-readable summary.** The prose above is for a human
+    reading Slack; this block is what makes runs countable ("how many CVEs did we close
+    this month"). The server extracts the LAST ```json block in your final message and
+    files it under `$STATE_DIR/runs/`. Emit exactly one, as the last thing you write, with
+    every field present — use `[]` or `null` rather than omitting a key:
+
+    ```json
+    {
+      "project": "<registry name>",
+      "outcome": "fixed | nothing-to-do | unfixable-only | broke | error",
+      "findings_total": 0,
+      "findings_new": 0,
+      "cves_fixed": [],
+      "cves_unfixable": [],
+      "cves_already_fixed_in_base": [],
+      "pr_url": null,
+      "base_branch": null,
+      "tests": "green | red | pre-existing-red | skipped | incomplete",
+      "image_scan": "green | red | skipped | no-dockerfile",
+      "slack_notified": true,
+      "clone_kept": null,
+      "notes": "one line, anything a human should know"
+    }
+    ```
+
+    Report it as it actually happened. `"slack_notified": false` when a message was needed
+    and could not be delivered is exactly the signal this block exists to carry — never
+    round it up to true.
+
 
 ## Rules
 
@@ -283,6 +321,9 @@ runs before (processes vanish with no summary). So:
   key registered on GitHub. Override it and GitHub marks the signature Unverified, and repos
   that require verified signatures reject the push.
 - Never force-push, never touch the base branch, never merge your own PR.
+- Tag every image you build `vuln-fix-agent-verify/<project>:<something>`, and mark a
+  clone you need preserved with `.vuln-fix-keep`. Anything outside that namespace or
+  without that marker is reaped after the run — by design.
 - Never commit a secret, token, or key. If a scan flags one in the repo, Slack it and do
   NOT rewrite history to "fix" it.
 - Report tests and scans as they actually ran. If you skipped a step, say you skipped it.
