@@ -9,7 +9,7 @@ on:
 jobs:
   offline:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 10   # a hang should fail fast, not idle for the 6h default
     steps:
       - uses: actions/checkout@v4
 

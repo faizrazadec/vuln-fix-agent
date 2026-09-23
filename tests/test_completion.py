@@ -13,6 +13,7 @@ import os
 import pathlib
 import subprocess
 import tempfile
+import time
 
 os.environ.setdefault("A2A_TOKEN", "test-token")
 # Every run now writes a summary, so point that at a scratch dir, not /home/agent/state.
@@ -200,10 +201,11 @@ def spawn_orphan(marker):
     sleep is reparented away from us, and only its environment says whose it is."""
     env = {**os.environ, main.RUN_ENV: marker}
     subprocess.run(["sh", "-c", "nohup sleep 300 >/dev/null 2>&1 &"], env=env, check=True)
-    for _ in range(50):
+    # time.sleep, not asyncio: this also runs inside the fake session's event loop.
+    for _ in range(100):
         if main._run_pids(marker):
             return
-        asyncio.run(asyncio.sleep(0.05))
+        time.sleep(0.05)
     raise AssertionError("orphan never appeared")
 
 
@@ -222,8 +224,14 @@ def test_cancel_kills_leftovers():
 
     async def scenario():
         t = asyncio.create_task(main.ClaudeCodeExecutor().execute(_Ctx(), _Q()))
-        while _Ctx.task_id not in main._RUNNING or not main._run_pids(_Ctx.task_id):
+        # Bounded: a session that dies before spawning must fail the test, not hang CI.
+        for _ in range(200):
+            if _Ctx.task_id in main._RUNNING and main._run_pids(_Ctx.task_id):
+                break
+            assert not t.done(), f"session ended before its orphan appeared: {up.__dict__}"
             await asyncio.sleep(0.05)
+        else:
+            raise AssertionError("run never reached the orphan-spawned state")
         await main.ClaudeCodeExecutor().cancel(_Ctx(), _Q())
         try:
             await t
