@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""Roll up the per-run summaries in $STATE_DIR/runs/ — "what did the agent actually do?"
+
+    vuln-report                      # last 30 days, every project
+    vuln-report --days 7
+    vuln-report --since 2026-09-01
+    vuln-report --project alkaline3
+    vuln-report --json               # the same numbers, machine-readable
+
+The server writes one file per run (see _save_run_summary in main.py): the agent's own
+JSON block, plus a `run` object with turns, duration and API-equivalent cost that the
+server measured. A run that died before writing its block still gets a file, marked
+`summary_missing`, so failures are counted rather than invisible.
+
+CVE counts are unique per project across the window: a CVE fixed on an adopted PR that
+three nightly runs touched is one CVE, not three.
+
+Exit codes: 0 success (including "no runs in the window"), 2 usage error.
+"""
+
+import collections
+import datetime
+import json
+import os
+import pathlib
+import sys
+
+STATE_DIR = pathlib.Path(os.environ.get("STATE_DIR", "/home/agent/state"))
+
+
+def die(msg, code=2):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def opt(args, name):
+    """Pull `--name value` out of the argument list, returning the value."""
+    if name not in args:
+        return None
+    i = args.index(name)
+    if i + 1 >= len(args):
+        die(f"{name} needs a value")
+    value = args[i + 1]
+    del args[i:i + 2]
+    return value
+
+
+def run_date(path, data):
+    """finished_at if it parses, else the YYYYMMDD prefix every filename carries."""
+    try:
+        return datetime.datetime.fromisoformat(data["finished_at"]).date()
+    except (KeyError, TypeError, ValueError):
+        pass
+    try:
+        return datetime.datetime.strptime(path.name[:8], "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+def load_runs(since, project):
+    runs, unreadable = [], []
+    for f in sorted((STATE_DIR / "runs").glob("*.json")):
+        try:
+            data = json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError):
+            unreadable.append(f.name)
+            continue
+        if not isinstance(data, dict):
+            unreadable.append(f.name)
+            continue
+        day = run_date(f, data)
+        if day is None or day < since:
+            continue
+        if project and str(data.get("project", "")).lower() != project.lower():
+            continue
+        data["_file"], data["_date"] = f.name, day.isoformat()
+        runs.append(data)
+    return runs, unreadable
+
+
+def strs(v):
+    return [x for x in v if isinstance(x, str)] if isinstance(v, list) else []
+
+
+def num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def summarise(runs):
+    per = {}
+    for r in runs:
+        p = per.setdefault(str(r.get("project") or "unknown"), {
+            "runs": 0, "outcomes": collections.Counter(), "cves_fixed": set(),
+            "cves_unfixable": set(), "prs": set(), "duration_ms": 0, "cost_usd": 0.0,
+            "measured_runs": 0, "flagged": [],
+        })
+        p["runs"] += 1
+        p["outcomes"][str(r.get("outcome") or "unknown")] += 1
+        p["cves_fixed"].update(strs(r.get("cves_fixed")))
+        p["cves_unfixable"].update(strs(r.get("cves_unfixable")))
+        if isinstance(r.get("pr_url"), str) and r["pr_url"]:
+            p["prs"].add(r["pr_url"])
+        m = r.get("run") if isinstance(r.get("run"), dict) else {}
+        if num(m.get("duration_ms")) is not None:
+            p["measured_runs"] += 1
+            p["duration_ms"] += m["duration_ms"]
+            p["cost_usd"] += num(m.get("total_cost_usd")) or 0.0
+
+        why = []
+        if r.get("summary_missing"):
+            why.append(f"no summary block ({m.get('status', 'unknown')}: "
+                       f"{r.get('notes') or m.get('reason') or '?'})")
+        if r.get("validation_errors"):
+            why.append("contract errors: " + "; ".join(strs(r["validation_errors"])))
+        # Older runs wrote false for "no message needed" before null existed for it; a
+        # nothing-to-do run never needs one, so only trust false where one was due.
+        if r.get("slack_notified") is False and r.get("outcome") != "nothing-to-do":
+            why.append("Slack notification NOT delivered")
+        if why:
+            p["flagged"].append({"file": r["_file"], "date": r["_date"], "why": why})
+    return per
+
+
+def as_json(per, since, unreadable):
+    projects = {
+        name: {
+            "runs": p["runs"],
+            "outcomes": dict(p["outcomes"]),
+            "cves_fixed": sorted(p["cves_fixed"]),
+            "cves_unfixable": sorted(p["cves_unfixable"]),
+            "prs": sorted(p["prs"]),
+            "measured_runs": p["measured_runs"],
+            "duration_ms": p["duration_ms"],
+            "cost_usd": round(p["cost_usd"], 4),
+            "flagged": p["flagged"],
+        }
+        for name, p in sorted(per.items())
+    }
+    return {
+        "since": since.isoformat(),
+        "runs": sum(p["runs"] for p in per.values()),
+        "cves_fixed": sum(len(p["cves_fixed"]) for p in per.values()),
+        "prs": sum(len(p["prs"]) for p in per.values()),
+        "projects": projects,
+        "unreadable_files": unreadable,
+    }
+
+
+def minutes(ms):
+    return f"{ms / 60000:.0f}m"
+
+
+def print_table(per, since, unreadable):
+    if not per:
+        print(f"no runs since {since}")
+    else:
+        print(f"runs since {since}\n")
+        print(f"  {'PROJECT':22} {'RUNS':>4} {'FIXED':>5} {'UNFIX':>5} {'PRS':>3} "
+              f"{'TIME':>6} {'COST$':>7}  OUTCOMES")
+        for name, p in sorted(per.items()):
+            measured = p["measured_runs"]
+            t = minutes(p["duration_ms"]) if measured else "-"
+            c = f"{p['cost_usd']:.2f}" if measured else "-"
+            outcomes = ", ".join(f"{k} {v}" for k, v in p["outcomes"].most_common())
+            print(f"  {name[:22]:22} {p['runs']:>4} {len(p['cves_fixed']):>5} "
+                  f"{len(p['cves_unfixable']):>5} {len(p['prs']):>3} {t:>6} {c:>7}  {outcomes}")
+
+        runs = sum(p["runs"] for p in per.values())
+        idle = sum(p["outcomes"]["nothing-to-do"] + p["outcomes"]["unfixable-only"]
+                   for p in per.values())
+        print(f"\n  {runs} runs, {sum(len(p['cves_fixed']) for p in per.values())} unique "
+              f"CVEs fixed, {sum(len(p['prs']) for p in per.values())} PRs; "
+              f"{idle} run(s) ended with nothing to change")
+        unmeasured = runs - sum(p["measured_runs"] for p in per.values())
+        if unmeasured:
+            print(f"  TIME/COST cover measured runs only — {unmeasured} run(s) predate "
+                  "the metrics or ended without a ResultMessage")
+
+        flagged = [(n, f) for n, p in sorted(per.items()) for f in p["flagged"]]
+        if flagged:
+            print("\n  needs a look:")
+            for name, f in flagged:
+                for why in f["why"]:
+                    print(f"    {f['date']} {name}: {why}")
+    if unreadable:
+        print(f"\n  unreadable summary files: {', '.join(unreadable)}", file=sys.stderr)
+
+
+def main():
+    argv = sys.argv[1:]
+    want_json = "--json" in argv
+    if want_json:
+        argv.remove("--json")
+    days, since_s, project = opt(argv, "--days"), opt(argv, "--since"), opt(argv, "--project")
+    if argv:
+        die(f"unexpected argument(s): {' '.join(argv)}\n"
+            "usage: vuln-report [--days N | --since YYYY-MM-DD] [--project NAME] [--json]")
+    if days and since_s:
+        die("--days and --since are mutually exclusive")
+
+    today = datetime.date.today()
+    if since_s:
+        try:
+            since = datetime.date.fromisoformat(since_s)
+        except ValueError:
+            die(f"--since wants YYYY-MM-DD, got {since_s!r}")
+    else:
+        try:
+            n = int(days or 30)
+        except ValueError:
+            die(f"--days wants a number, got {days!r}")
+        if n < 1:
+            die("--days must be at least 1")
+        since = today - datetime.timedelta(days=n - 1)
+
+    runs, unreadable = load_runs(since, project)
+    per = summarise(runs)
+    if want_json:
+        print(json.dumps(as_json(per, since, unreadable), indent=2))
+    else:
+        print_table(per, since, unreadable)
+
+
+if __name__ == "__main__":
+    main()

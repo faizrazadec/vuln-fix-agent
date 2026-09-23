@@ -136,6 +136,72 @@ def test_slack_unconfigured_is_exit_4():
     print("slack-notify reports unconfigured as exit 4")
 
 
+def write_run(name, **summary):
+    runs = pathlib.Path(STATE, "runs")
+    runs.mkdir(exist_ok=True)
+    (runs / name).write_text(json.dumps(summary))
+
+
+def test_report_counts_unique_cves_and_flags_problems():
+    """Three runs touching one adopted PR are one PR and one CVE, not three.
+
+    And the report must surface exactly the runs a human needs to look at: a missing
+    summary, a broken contract, an undelivered Slack message where one was due — but not
+    `false` on a nothing-to-do run, which older summaries wrote for "none needed".
+    """
+    today = __import__("datetime").date.today().isoformat()
+    pr = "https://example/pull/7"
+    write_run("r1.json", project="alpha", outcome="fixed", cves_fixed=["CVE-1", "CVE-2"],
+              pr_url=pr, slack_notified=True, finished_at=today + "T03:00:00+00:00",
+              run={"status": "completed", "duration_ms": 120000, "total_cost_usd": 1.5})
+    write_run("r2.json", project="alpha", outcome="fixed", cves_fixed=["CVE-2", "CVE-3"],
+              pr_url=pr, slack_notified=False, finished_at=today + "T04:00:00+00:00",
+              run={"status": "completed", "duration_ms": 60000, "total_cost_usd": 0.5})
+    write_run("r3.json", project="alpha", outcome="nothing-to-do", cves_fixed=[],
+              pr_url=None, slack_notified=False, finished_at=today + "T05:00:00+00:00")
+    write_run("r4.json", project="beta", outcome="error", summary_missing=True,
+              notes="hit the turn cap", finished_at=today + "T06:00:00+00:00",
+              run={"status": "failed", "reason": "hit the turn cap"})
+    write_run("r5.json", project="beta", outcome="done", validation_errors=["bad outcome"],
+              finished_at=today + "T07:00:00+00:00")
+    write_run("20200101-old-x.json", project="alpha", outcome="fixed",
+              cves_fixed=["CVE-OLD"], pr_url="https://example/pull/1")
+    pathlib.Path(STATE, "runs", "junk.json").write_text("{not json")
+
+    r = run("vuln-report", "--json")
+    assert r.returncode == 0, r
+    d = json.loads(r.stdout)
+    a = d["projects"]["alpha"]
+    assert a["runs"] == 3, "the 2020 run is outside the default 30-day window"
+    assert a["cves_fixed"] == ["CVE-1", "CVE-2", "CVE-3"], a
+    assert a["prs"] == [pr] and a["measured_runs"] == 2, a
+    assert a["duration_ms"] == 180000 and a["cost_usd"] == 2.0, a
+    assert [f["file"] for f in a["flagged"]] == ["r2.json"], a["flagged"]
+    b = d["projects"]["beta"]
+    assert {f["file"] for f in b["flagged"]} == {"r4.json", "r5.json"}, b["flagged"]
+    assert d["unreadable_files"] == ["junk.json"], d
+
+    r = run("vuln-report", "--project", "ALPHA", "--since", "2019-12-31", "--json")
+    d = json.loads(r.stdout)
+    assert list(d["projects"]) == ["alpha"] and "CVE-OLD" in d["projects"]["alpha"]["cves_fixed"]
+
+    r = run("vuln-report")
+    assert r.returncode == 0 and "3 unique CVEs fixed" in r.stdout, r.stdout
+    assert "needs a look" in r.stdout and "hit the turn cap" in r.stdout, r.stdout
+    print("vuln-report dedupes CVEs/PRs, windows by date, flags only real problems")
+
+
+def test_report_usage_errors():
+    for args in (["--days"], ["--days", "x"], ["--days", "0"], ["--since", "yesterday"],
+                 ["--days", "3", "--since", "2026-01-01"], ["stray"]):
+        r = run("vuln-report", *args)
+        assert r.returncode == 2 and "Traceback" not in r.stderr, (args, r)
+    empty = tempfile.TemporaryDirectory()
+    r = run("vuln-report", STATE_DIR=empty.name)
+    assert r.returncode == 0 and "no runs" in r.stdout, r
+    print("vuln-report usage errors are exit 2; no runs dir is not an error")
+
+
 if __name__ == "__main__":
     test_ledger_usage_errors()
     test_ledger_tolerates_partial_state_file()
@@ -145,4 +211,6 @@ if __name__ == "__main__":
     test_resolved_clears_notified()
     test_vanta_unknown_project()
     test_slack_unconfigured_is_exit_4()
+    test_report_counts_unique_cves_and_flags_problems()
+    test_report_usage_errors()
     print("ok")

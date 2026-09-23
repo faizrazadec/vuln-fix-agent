@@ -219,7 +219,9 @@ def main():
 
     if not REGISTRY.exists():
         die(f"missing {REGISTRY}", 4)
-    projects = json.loads(REGISTRY.read_text())
+    # Skip non-object entries such as the example registry's "_comment".
+    projects = {k: v for k, v in json.loads(REGISTRY.read_text()).items()
+                if isinstance(v, dict)}
 
     if "--check-registry" in sys.argv:
         sys.exit(check_registry(projects))

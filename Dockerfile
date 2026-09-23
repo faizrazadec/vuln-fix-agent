@@ -40,7 +40,9 @@ RUN install -m0755 -d /etc/apt/keyrings \
 RUN curl -sfL "https://raw.githubusercontent.com/aquasecurity/trivy/v${TRIVY_VERSION}/contrib/install.sh" \
       | sh -s -- -b /usr/local/bin "v${TRIVY_VERSION}"
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+# Pinned like the ARGs above (COPY --from cannot expand an ARG). Keep it in step with
+# the uv version in .github/workflows/tests.yml.
+COPY --from=ghcr.io/astral-sh/uv:0.12.17 /uv /usr/local/bin/uv
 
 WORKDIR /app
 COPY pyproject.toml uv.lock ./

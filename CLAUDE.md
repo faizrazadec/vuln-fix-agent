@@ -21,12 +21,14 @@ The `claude` CLI must be logged in once inside the container; credentials persis
 
 ```
 app/       what runs inside the container: main.py, entrypoint.sh, bin/ (agent
-           CLI tools: vanta-findings, slack-notify, vuln-ledger), skills/vuln-fix,
+           CLI tools: vanta-findings, slack-notify, vuln-ledger, vuln-report), skills/vuln-fix,
            and projects.json (the registry — gitignored; projects.example.json is the template)
 scripts/   host-side ops: ask.sh (fire one run), VulnFixAgent (the scheduled batch runner),
            load-keys.sh (load SSH keys into the volume)
 deploy/    the crontab entry for the weekday schedule
-tests/     assert-based scripts (add app/ to sys.path, then import main)
+tests/     assert-based scripts (add app/ to sys.path, then import main); fixtures/registry.json
+           is the registry CI copies into app/projects.json
+.github/   CI: the four offline suites on every push (never test_smoke.py — it burns quota)
 Dockerfile, compose.yml, pyproject.toml, uv.lock, .env  — at the root
 ```
 
@@ -43,6 +45,7 @@ uv run python tests/test_smoke.py            # end-to-end — spawns real Claude
 uv run python tests/test_smoke.py --card-only  # agent-card assertions only, no quota
 
 docker compose exec -u agent vuln-fix-agent vanta-findings --check-registry  # stale asset names
+docker compose exec -u agent vuln-fix-agent vuln-report     # last 30 days: CVEs fixed, PRs, cost, what needs a look
 ./scripts/VulnFixAgent <project>             # one project; --no-skip to ignore the pre-filter
 
 docker compose up -d --build
@@ -85,6 +88,11 @@ Three decisions there are load-bearing and easy to break:
 - **Run summaries.** The skill ends every report with a fenced ```json block; the executor
   extracts the last one into `$STATE_DIR/runs/`. Without it the only record of a run is
   prose in `vuln-run.log`, which cannot answer "how many CVEs did we close this month".
+  Every run that reached Claude gets a file — one with no block is recorded as
+  `summary_missing` rather than skipped, or runs/ would only count the runs that went well.
+  The server adds a `run` object (status, turns, duration, API-equivalent cost) and checks
+  the block against SKILL.md step 10, storing `validation_errors` instead of dropping it.
+  `vuln-report` reads all of this; `_validate_summary` and the step-10 template move together.
 - **Task store.** File-backed under `$STATE_DIR/tasks`, so a restart no longer leaves a
   poller holding an id the server has never heard of. It subclasses a private a2a-sdk class
   to inherit owner-scoped `get`/`list`; the import is guarded and degrades to in-memory.
@@ -123,6 +131,13 @@ needs the REST API.
   plus a `can_use_tool` callback.
 - A restart still kills the running Claude session — the task *record* survives now, the
   work does not. There is no resume.
+- **Cancel cleans up by env marker.** Every process the session spawns inherits
+  `VULN_FIX_RUN=<task_id>`; `cancel()` kills whatever still carries it (the `nohup`'d
+  suites and builds the system prompt tells the agent to start) and removes running
+  `vuln-fix-agent-verify/*` containers. Orphans have no parent to find them by — the
+  marker is the only link, so don't strip the env in anything the agent launches.
+- **`projects.json` entries that aren't objects are ignored** by `main.py`, `vanta-findings`
+  and `VulnFixAgent` — that's how the example's `_comment` survives being copied verbatim.
 - **Cleanup is the runner's job, not the agent's.** `VulnFixAgent` reaps the workspace and
   the `vuln-fix-agent-verify/*` image namespace after every project. The skill's contract is
   inverted accordingly: it marks a clone it wants kept with `.vuln-fix-keep`. An image

@@ -1,0 +1,29 @@
+name: tests
+
+# The offline suite only: no Claude session, no Vanta, no Docker. test_smoke.py spawns a
+# real Claude Code session and burns quota, so it stays a manual step.
+on:
+  push:
+  pull_request:
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.17"   # same as the Dockerfile's uv
+
+      - run: uv sync --frozen
+
+      # app/projects.json is gitignored (real infra names); tests read the registry from
+      # there, so give them the fixture.
+      - run: cp tests/fixtures/registry.json app/projects.json
+
+      - run: uv run python tests/test_protocol.py
+      - run: uv run python tests/test_registry.py
+      - run: uv run python tests/test_completion.py
+      - run: uv run python tests/test_bin.py

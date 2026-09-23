@@ -296,15 +296,18 @@ runs before (processes vanish with no summary). So:
       "base_branch": null,
       "tests": "green | red | pre-existing-red | skipped | incomplete",
       "image_scan": "green | red | skipped | no-dockerfile",
-      "slack_notified": true,
+      "slack_notified": "true | false | null",
       "clone_kept": null,
       "notes": "one line, anything a human should know"
     }
     ```
 
-    Report it as it actually happened. `"slack_notified": false` when a message was needed
-    and could not be delivered is exactly the signal this block exists to carry — never
-    round it up to true.
+    Report it as it actually happened. `slack_notified` has three values: `true` — every
+    message you needed to send was delivered; `false` — a message was needed and could
+    not be delivered, which is exactly the signal this block exists to carry, so never
+    round it up to true; `null` — no message was needed this run (e.g. nothing-to-do).
+    When `outcome` is `fixed`, `pr_url` and `cves_fixed` must both be filled in. The server
+    checks this contract and flags a summary that breaks it.
 
 
 ## Rules

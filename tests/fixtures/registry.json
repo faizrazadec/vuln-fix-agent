@@ -1,0 +1,8 @@
+{
+  "_comment": "CI stand-in for app/projects.json, which is gitignored (so this file cannot be named projects.json — the ignore rule matches at any depth). The workflow copies it into place. test_registry.py hardcodes snapdev-backend's URL, so keep that entry in step with it.",
+  "snapdev-backend": {
+    "repo": "git@github.com:Ember-AI-Engineering/snapdev-backend.git",
+    "vanta": { "assets": ["snapdev-backend-fixture"] },
+    "owners": [{ "name": "Fixture Owner", "slack_id": "U000FIXTURE" }]
+  }
+}

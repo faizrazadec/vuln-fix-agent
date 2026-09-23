@@ -11,6 +11,9 @@ import os
 import pathlib
 import re
 import secrets
+import signal
+import subprocess
+import time
 import uuid
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
@@ -62,7 +65,12 @@ MAX_TURNS = int(os.environ.get("MAX_TURNS", "200"))
 # $CLAUDE_CONFIG_DIR/skills. Only a pointer goes in the prompt — a bare string here would
 # send --system-prompt and REPLACE Claude Code's own prompt; preset+append adds to it.
 _pf = pathlib.Path(__file__).with_name("projects.json")
-PROJECTS: dict[str, dict] = json.loads(_pf.read_text()) if _pf.exists() else {}
+# Non-object entries are skipped: projects.example.json carries a "_comment" string,
+# and copying it verbatim (as it tells you to) used to crash the import.
+PROJECTS: dict[str, dict] = {
+    k: v for k, v in (json.loads(_pf.read_text()) if _pf.exists() else {}).items()
+    if isinstance(v, dict)
+}
 ALLOWED_URLS = {p["repo"] for p in PROJECTS.values() if p.get("repo")}
 # Vanta filters live under each project's "vanta" key and are read by bin/vanta-findings
 # straight from this registry, so a caller cannot widen them.
@@ -191,31 +199,125 @@ RPC_PATH = f"{BASE_PATH}{DEFAULT_RPC_URL}"
 # ---------------------------------------------------------------------------
 _SUMMARY_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
 
+# The contract SKILL.md step 10 asks for. A summary that breaks it is still saved — it is
+# the only record of the run — but carries `validation_errors`, so vuln-report can say
+# which numbers to distrust instead of silently counting them.
+_SUMMARY_ENUMS = {
+    "outcome": {"fixed", "nothing-to-do", "unfixable-only", "broke", "error"},
+    "tests": {"green", "red", "pre-existing-red", "skipped", "incomplete"},
+    "image_scan": {"green", "red", "skipped", "no-dockerfile"},
+}
+_SUMMARY_LISTS = ("cves_fixed", "cves_unfixable", "cves_already_fixed_in_base")
+_SUMMARY_KEYS = (
+    "project", "outcome", "findings_total", "findings_new", *_SUMMARY_LISTS, "pr_url",
+    "base_branch", "tests", "image_scan", "slack_notified", "clone_kept", "notes",
+)
 
-def _save_run_summary(task_id: str, text: str) -> pathlib.Path | None:
-    """Persist the last parseable JSON summary block in the agent's final report."""
+
+def _validate_summary(data: dict) -> list[str]:
+    errors = [f"missing key: {k}" for k in _SUMMARY_KEYS if k not in data]
+    for key, allowed in _SUMMARY_ENUMS.items():
+        if key in data and data[key] not in allowed:
+            errors.append(f"{key}={data[key]!r} not one of {sorted(allowed)}")
+    for key in _SUMMARY_LISTS:
+        v = data.get(key)
+        if key in data and not (isinstance(v, list) and all(isinstance(x, str) for x in v)):
+            errors.append(f"{key} must be a list of strings")
+    for key in ("findings_total", "findings_new"):
+        v = data.get(key)
+        if key in data and not (isinstance(v, int) and not isinstance(v, bool) and v >= 0):
+            errors.append(f"{key} must be a non-negative integer")
+    # null = no message was needed; false = one was needed and did not get through.
+    if "slack_notified" in data and data["slack_notified"] not in (True, False, None):
+        errors.append("slack_notified must be true, false or null")
+    if data.get("outcome") == "fixed":
+        if not data.get("pr_url"):
+            errors.append("outcome=fixed but pr_url is empty")
+        if not data.get("cves_fixed"):
+            errors.append("outcome=fixed but cves_fixed is empty")
+    return errors
+
+
+def _project_from_prompt(prompt: str) -> str | None:
+    """The registry name a prompt refers to, for runs that died before writing a summary.
+
+    Delimited on [\\w.-] so "Maritime" does not match inside "maritime-ai-hub"; the
+    longest hit wins when one name is a prefix of another.
+    """
+    hits = [
+        n for n in PROJECTS
+        if re.search(rf"(?<![\w.-]){re.escape(n)}(?![\w.-])", prompt, re.IGNORECASE)
+    ]
+    return max(hits, key=len) if hits else None
+
+
+def _run_metrics(result: ResultMessage | None, status: str, reason: str | None) -> dict:
+    """How the session itself went — what the agent's own summary cannot know."""
+    m: dict = {"status": status, "reason": reason}
+    if result is not None:
+        m.update(
+            num_turns=result.num_turns,
+            duration_ms=result.duration_ms,
+            duration_api_ms=result.duration_api_ms,
+            # API-equivalent: billing is the subscription, but this is what makes one
+            # project's cost comparable to another's.
+            total_cost_usd=result.total_cost_usd,
+            usage=result.usage,
+        )
+    return m
+
+
+def _save_run_summary(
+    task_id: str,
+    text: str,
+    prompt: str = "",
+    result: ResultMessage | None = None,
+    status: str = "completed",
+    reason: str | None = None,
+) -> pathlib.Path | None:
+    """Persist the last parseable JSON summary block in the agent's final report.
+
+    Every run that reached Claude gets a file, even one that crashed, hit the turn cap or
+    was cancelled before writing its block — otherwise runs/ only ever counted the runs
+    that went well, and the failures were visible nowhere but the log.
+    """
+    data = None
     for raw in reversed(_SUMMARY_RE.findall(text)):
         try:
-            data = json.loads(raw)
+            candidate = json.loads(raw)
         except json.JSONDecodeError:
             continue
-        if not isinstance(data, dict) or "project" not in data:
-            continue
-        data.setdefault("task_id", task_id)
-        data.setdefault("finished_at", datetime.datetime.now().astimezone().isoformat())
-        # Registry keys are plain names, but never build a path out of unvalidated text.
-        project = re.sub(r"[^\w.-]", "_", str(data["project"]))[:64] or "unknown"
-        out = STATE_DIR / "runs" / f"{datetime.date.today():%Y%m%d}-{project}-{task_id[:8]}.json"
-        try:
-            out.parent.mkdir(parents=True, exist_ok=True)
-            tmp = out.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data, indent=2) + "\n")
-            tmp.replace(out)
-            return out
-        except OSError as exc:
-            log.warning("could not write run summary: %r", exc)
-            return None
-    return None
+        if isinstance(candidate, dict) and "project" in candidate:
+            data = candidate
+            break
+
+    if data is None:
+        data = {
+            "project": _project_from_prompt(prompt) or "unknown",
+            "outcome": "error",
+            "summary_missing": True,
+            "notes": reason or "the agent's report had no JSON summary block",
+        }
+    elif errors := _validate_summary(data):
+        data["validation_errors"] = errors
+        print(f"[task {task_id}] summary has {len(errors)} contract error(s): "
+              + "; ".join(errors), flush=True)
+
+    data.setdefault("task_id", task_id)
+    data.setdefault("finished_at", datetime.datetime.now().astimezone().isoformat())
+    data["run"] = _run_metrics(result, status, reason)
+    # Registry keys are plain names, but never build a path out of unvalidated text.
+    project = re.sub(r"[^\w.-]", "_", str(data["project"]))[:64] or "unknown"
+    out = STATE_DIR / "runs" / f"{datetime.date.today():%Y%m%d}-{project}-{task_id[:8]}.json"
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2) + "\n")
+        tmp.replace(out)
+        return out
+    except OSError as exc:
+        log.warning("could not write run summary: %r", exc)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +399,84 @@ _RUN_LOCK = asyncio.Lock()
 _RUNNING: dict[str, asyncio.Task] = {}
 
 
+# ---------------------------------------------------------------------------
+# Cancel cleanup
+#
+# Cancelling a run stops the Claude CLI, but not what it left running. The system prompt
+# tells the agent to `nohup` anything that outlasts the Bash timeout — test suites, image
+# builds — which is exactly what makes those survive the CLI's death as orphans. And
+# `_RUN_LOCK` is released the moment the cancel lands, so the next run starts on top of
+# them: the OOM scenario the lock exists to prevent.
+#
+# Orphans lose their parentage, so they are found by an env marker instead: every process
+# the session spawns inherits RUN_ENV=<task_id> (nohup and setsid keep the environment).
+# That is precise — it cannot hit ssh-agent, the server, or anything a human started.
+# ---------------------------------------------------------------------------
+RUN_ENV = "VULN_FIX_RUN"
+
+
+def _run_pids(task_id: str) -> list[int]:
+    """Live processes carrying this run's marker. Zombies have an empty environ, so a
+    killed child waiting to be reaped drops out of this list too."""
+    marker = f"{RUN_ENV}={task_id}".encode()
+    me = os.getpid()
+    found = []
+    for d in pathlib.Path("/proc").iterdir():
+        if not d.name.isdigit() or int(d.name) == me:
+            continue
+        try:
+            if marker in (d / "environ").read_bytes().split(b"\0"):
+                found.append(int(d.name))
+        except OSError:  # gone already, or not ours to read
+            continue
+    return found
+
+
+def _kill_run_leftovers(task_id: str, grace: float = 5.0) -> int:
+    """SIGTERM this run's processes, SIGKILL whatever ignores it. Returns how many."""
+    pids = _run_pids(task_id)
+    total = len(pids)
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                pass
+        deadline = time.monotonic() + grace
+        while pids and time.monotonic() < deadline:
+            time.sleep(0.2)
+            pids = _run_pids(task_id)
+        if not pids:
+            break
+    return total
+
+
+def _stop_verify_containers() -> list[str]:
+    """Remove running containers from this run's verify images.
+
+    `docker run -d` containers belong to the host daemon, so no signal reaches them. Only
+    one run exists at a time, so every container in the namespace SKILL.md mandates is
+    this run's. Images and clones are left for the batch runner's reap, as before.
+    """
+    try:
+        out = subprocess.run(
+            ["docker", "ps", "--format", "{{.ID}} {{.Image}}"],
+            capture_output=True, text=True, timeout=30, check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    ids = [
+        cid for cid, _, image in (line.partition(" ") for line in out.splitlines())
+        if image.startswith("vuln-fix-agent-verify/")
+    ]
+    if ids:
+        try:
+            subprocess.run(["docker", "rm", "-f", *ids], capture_output=True, timeout=60, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return []
+    return ids
+
+
 class ClaudeCodeExecutor(AgentExecutor):
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         # Task lifecycle rather than a bare reply message: a vuln-fix run takes far
@@ -361,6 +541,8 @@ class ClaudeCodeExecutor(AgentExecutor):
             # can_use_tool callback if you expose this beyond your own network.
             permission_mode="bypassPermissions",
             max_turns=MAX_TURNS,
+            # Inherited by everything the session spawns, so a cancel can find it all.
+            env={RUN_ENV: context.task_id},
             stderr=lambda line: print(f"[claude stderr] {line}", flush=True),
         )
         chunks: list[str] = []
@@ -379,16 +561,24 @@ class ClaudeCodeExecutor(AgentExecutor):
                                 message=updater.new_agent_message([Part(text=block.text)]),
                             )
         except asyncio.CancelledError:
-            print(f"[task {context.task_id}] CANCELLED", flush=True)
+            killed = await asyncio.to_thread(_kill_run_leftovers, context.task_id)
+            stopped = await asyncio.to_thread(_stop_verify_containers)
+            print(f"[task {context.task_id}] CANCELLED — killed {killed} leftover "
+                  f"process(es), removed {len(stopped)} verify container(s)", flush=True)
+            _save_run_summary(context.task_id, "\n".join(chunks), prompt,
+                              status="cancelled", reason="cancelled mid-run")
             await updater.cancel(
                 updater.new_agent_message([
-                    Part(text="Cancelled mid-run. Any clone or image this run created is "
-                              "still on disk; the next scheduled run reaps them.")
+                    Part(text=f"Cancelled mid-run. Stopped {killed} leftover process(es) and "
+                              f"{len(stopped)} verify container(s). Any clone or image this "
+                              "run created is still on disk; the next scheduled run reaps them.")
                 ])
             )
             raise
         except Exception as exc:
             print(f"[executor] failed: {exc!r}", flush=True)
+            _save_run_summary(context.task_id, "\n".join(chunks), prompt,
+                              status="failed", reason=f"executor raised {exc!r}"[:300])
             await updater.failed(updater.new_agent_message([Part(text=str(exc))]))
             return
 
@@ -412,7 +602,8 @@ class ClaudeCodeExecutor(AgentExecutor):
         # Prefer the SDK's final result text over joined progress chunks.
         final_text = (result.result if result and result.result else "\n".join(chunks)) or "(no output)"
 
-        saved = _save_run_summary(context.task_id, final_text)
+        saved = _save_run_summary(context.task_id, final_text, prompt, result,
+                                  status="failed" if reason else "completed", reason=reason)
         if saved:
             print(f"[task {context.task_id}] summary -> {saved}", flush=True)
 

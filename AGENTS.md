@@ -84,6 +84,8 @@ docker compose exec -u agent vuln-fix-agent \
 uv run python tests/test_protocol.py                # offline, free, five checks
 uv run python tests/test_bin.py                     # offline, the app/bin exit-code contract
 docker compose exec -u agent vuln-fix-agent \
+  vuln-report --days 7                              # what the last week's runs did
+docker compose exec -u agent vuln-fix-agent \
   vanta-findings --check-registry                   # stale asset names in projects.json
 docker compose exec -u agent vuln-fix-agent \
   sh -c 'ls /home/agent/workspace'                  # should be empty but for .pnpm-store
@@ -93,6 +95,13 @@ docker images --format '{{.Repository}}' | grep vuln-fix-agent-verify   # should
 ## Change log
 
 Newest first. One line per infrastructure change, with the date.
+
+- **2026-09-23** — uv pinned to 0.12.17 in the Dockerfile (was `:latest`). CI added
+  (`.github/workflows/tests.yml`, offline suites only). Run summaries now carry server-side
+  metrics and contract checks; `vuln-report` added. Cancel kills the run's orphaned
+  processes. **Takes effect only after `docker compose build`** — see the retag gotcha.
+  alkaline3's base branch changed `main` → `staging-internal` in `app/projects.json`
+  (registry is gitignored, so this line is the only tracked record of it).
 
 - **2026-09-15** — Audit fixes. Reaping moved out of SKILL.md into `VulnFixAgent` (runs had
   been leaving 300MB+ verify images and week-old clones behind). Batch runner now
@@ -125,10 +134,11 @@ Newest first. One line per infrastructure change, with the date.
   unfixable-finding notices were not delivered (see `vuln-run.log`). The agent reports this
   honestly rather than assuming delivery. Fix by inviting the connector's account to the
   channel; nothing in this repo needs to change.
-- **`dynamic-regulations` has two stale Vanta asset names.** `vanta-findings
-  --check-registry` names them. Findings for the one asset that resolves are collected
-  normally now, but the other two contribute nothing until they are re-registered in Vanta
-  or removed from `projects.json`.
+- **Two projects have no Vanta coverage at all** — `gd-discovery-app` and `m-a` fail
+  `vanta-findings` with exit 3 (no asset in scope resolves) on every nightly run, per
+  `vuln-run.log` 2026-09-22/23. The batch skips them and counts them as errored; nobody is
+  told. `vanta-findings --check-registry` names the stale assets. (`dynamic-regulations`,
+  listed here before, now resolves.)
 
 - The pre-rename `a2claude_*` volumes and the `a2claude:latest` image tag still exist as a
   rollback path. Safe to delete once the current stack has run a full cycle; nothing

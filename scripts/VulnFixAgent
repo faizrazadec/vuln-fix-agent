@@ -115,7 +115,7 @@ REAP
 if [ ${#ARGS[@]} -gt 0 ]; then
   PROJECTS="${ARGS[*]}"
 else
-  PROJECTS=$(python3 -c 'import json;print(*json.load(open("app/projects.json")))' 2>/dev/null)
+  PROJECTS=$(python3 -c 'import json;print(*(k for k, v in json.load(open("app/projects.json")).items() if isinstance(v, dict)))' 2>/dev/null)
 fi
 if [ -z "$PROJECTS" ]; then
   say "no projects in app/projects.json — nothing to do"; exit 0
