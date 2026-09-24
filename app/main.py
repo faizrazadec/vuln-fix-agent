@@ -540,6 +540,9 @@ class ClaudeCodeExecutor(AgentExecutor):
             # ponytail: trusts every caller; swap for permission_mode="default" + a
             # can_use_tool callback if you expose this beyond your own network.
             permission_mode="bypassPermissions",
+            # The claude.ai Slack connector posts as whoever logged in; slack-notify
+            # posts as the bot. A server-level deny rule covers every tool it exposes.
+            disallowed_tools=["mcp__claude_ai_Slack"],
             max_turns=MAX_TURNS,
             # Inherited by everything the session spawns, so a cancel can find it all.
             env={RUN_ENV: context.task_id},

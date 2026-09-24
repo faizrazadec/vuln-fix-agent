@@ -96,6 +96,10 @@ docker images --format '{{.Repository}}' | grep vuln-fix-agent-verify   # should
 
 Newest first. One line per infrastructure change, with the date.
 
+- **2026-09-24** — Slack now posts as the **Vuln Fix Agent** bot: `SLACK_WEBHOOK_URL` set in
+  `.env` (Incoming Webhook bound to #development-and-pr-reviews), SKILL.md uses `slack-notify`
+  as the only path, and `main.py` denies the `mcp__claude_ai_Slack` connector, which posted
+  as Faiz's own account.
 - **2026-09-23** — uv pinned to 0.12.17 in the Dockerfile (was `:latest`). CI added
   (`.github/workflows/tests.yml`, offline suites only). Run summaries now carry server-side
   metrics and contract checks; `vuln-report` added. Cancel kills the run's orphaned
@@ -127,13 +131,6 @@ Newest first. One line per infrastructure change, with the date.
 
 ## Known loose ends
 
-- **Slack delivery goes through the claude.ai MCP connector, by design** — `SLACK_WEBHOOK_URL`
-  is deliberately empty and the `slack-notify` CLI is only a last-resort fallback that will
-  report exit 4. As of the 2026-09-14/15 runs the connector authenticated but
-  `slack_search_channels` could not resolve `#development-and-pr-reviews`, so PR and
-  unfixable-finding notices were not delivered (see `vuln-run.log`). The agent reports this
-  honestly rather than assuming delivery. Fix by inviting the connector's account to the
-  channel; nothing in this repo needs to change.
 - **Two projects have no Vanta coverage at all** — `gd-discovery-app` and `m-a` fail
   `vanta-findings` with exit 3 (no asset in scope resolves) on every nightly run, per
   `vuln-run.log` 2026-09-22/23. The batch skips them and counts them as errored; nobody is
