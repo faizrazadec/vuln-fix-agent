@@ -27,3 +27,4 @@ jobs:
       - run: uv run python tests/test_registry.py
       - run: uv run python tests/test_completion.py
       - run: uv run python tests/test_bin.py
+      - run: python3 scripts/check_changelog_entries.py

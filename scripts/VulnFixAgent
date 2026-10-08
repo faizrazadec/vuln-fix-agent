@@ -124,6 +124,18 @@ fi
 say "=== run-all start: $PROJECTS ==="
 ran=0; skipped=0; errored=0
 for proj in $PROJECTS; do
+  # --- ticket sync ----------------------------------------------------------------
+  # Close Linear tickets whose fix PR merged. Here, not in the skill: once a fix merges
+  # and the image is rebuilt, the project usually has no findings left, so the pre-filter
+  # below skips it and no session would ever notice the merge.
+  inside linear-ticket sync "$proj" 2>&1 | sed 's/^/  /'
+
+  # Exception tickets whose review date has come. A deactivated finding is invisible to
+  # vanta-findings, so this — not the finding count — is what brings it back for review.
+  DUE=$(inside vuln-ledger "$proj" tickets --due 2>/dev/null | python3 -c 'import json,sys
+try: print(len(json.load(sys.stdin)))
+except Exception: print(0)' 2>/dev/null)
+
   # --- pre-filter -----------------------------------------------------------------
   # Most projects have no open findings on most days, and the agent's only way to learn
   # that was to spawn a full Claude Code session (~60s and real quota) to shell out to
@@ -142,7 +154,9 @@ for proj in $PROJECTS; do
     N=$(printf '%s' "$FINDINGS" | python3 -c 'import json,sys
 try: print(len(json.load(sys.stdin)))
 except Exception: print(-1)' 2>/dev/null)
-    if [ "$N" = 0 ]; then
+    if [ "$N" = 0 ] && [ "${DUE:-0}" -gt 0 ]; then
+      say "--- $proj: no open findings, but $DUE exception review(s) due — dispatching"
+    elif [ "$N" = 0 ]; then
       say "--- $proj: no open findings — skipped (no session spawned)"
       skipped=$((skipped + 1)); continue
     elif [ "$N" = -1 ]; then

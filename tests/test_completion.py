@@ -127,6 +127,7 @@ def latest_summary():
 GOOD = {
     "project": "demo", "outcome": "fixed", "findings_total": 3, "findings_new": 2,
     "cves_fixed": ["CVE-1"], "cves_unfixable": [], "cves_already_fixed_in_base": [],
+    "cves_deactivated": [], "tickets": ["EMB-1"],
     "pr_url": "https://example/pull/1", "base_branch": "develop", "tests": "green",
     "image_scan": "green", "slack_notified": True, "clone_kept": None, "notes": "",
 }

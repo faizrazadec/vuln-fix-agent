@@ -207,7 +207,8 @@ _SUMMARY_ENUMS = {
     "tests": {"green", "red", "pre-existing-red", "skipped", "incomplete"},
     "image_scan": {"green", "red", "skipped", "no-dockerfile"},
 }
-_SUMMARY_LISTS = ("cves_fixed", "cves_unfixable", "cves_already_fixed_in_base")
+_SUMMARY_LISTS = ("cves_fixed", "cves_unfixable", "cves_already_fixed_in_base",
+                  "cves_deactivated", "tickets")
 _SUMMARY_KEYS = (
     "project", "outcome", "findings_total", "findings_new", *_SUMMARY_LISTS, "pr_url",
     "base_branch", "tests", "image_scan", "slack_notified", "clone_kept", "notes",
@@ -542,7 +543,9 @@ class ClaudeCodeExecutor(AgentExecutor):
             permission_mode="bypassPermissions",
             # The claude.ai Slack connector posts as whoever logged in; slack-notify
             # posts as the bot. A server-level deny rule covers every tool it exposes.
-            disallowed_tools=["mcp__claude_ai_Slack"],
+            # Linear likewise: linear-ticket is scoped to the register project and keeps
+            # the ledger in step, the connector would do neither.
+            disallowed_tools=["mcp__claude_ai_Slack", "mcp__claude_ai_Linear"],
             max_turns=MAX_TURNS,
             # Inherited by everything the session spawns, so a cancel can find it all.
             env={RUN_ENV: context.task_id},

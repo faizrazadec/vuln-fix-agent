@@ -1,0 +1,11 @@
+#!/usr/bin/env sh
+# Validate changelog entries when a commit touches them (see changelog/README.md).
+# Enabled by `git config core.hooksPath .githooks` (or a `prepare` script does it).
+set -eu
+
+if git diff --cached --name-only | grep -qE '^(CHANGELOG\.md|changelog/|scripts/check_changelog_entries\.py)'; then
+  python3 scripts/check_changelog_entries.py || {
+    echo "pre-commit: fix the changelog entries above (rules: changelog/README.md)." >&2
+    exit 1
+  }
+fi

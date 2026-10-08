@@ -3,7 +3,16 @@
 
     vanta-findings snapdev-backend            # human-readable
     vanta-findings snapdev-backend --json     # machine-readable, for the agent
+    vanta-findings snapdev-backend --json --deactivated   # findings WE have deactivated
     vanta-findings --check-registry           # do every project's assets resolve in Vanta?
+    vanta-findings snapdev-backend deactivate <CVE> --reason "..." [--indefinite]
+
+`deactivate` marks every record of that CVE in the project's scope as an exception in
+Vanta (one CVE is usually several records, one per image). By default the exception ends
+after EXCEPTION_REVIEW_DAYS (30) and lifts early by itself once Vanta sees a fix — the
+case where no patch exists. `--indefinite` sets no end date and no auto-lift, for the case
+where Vanta lists a fix we cannot actually reach (vendored binary, net regression); the
+review date for those lives on the Linear ticket instead.
 
 Uses the Vanta REST API (OAuth2 client credentials), not the browser session — a
 scraped `connect.sid` dies on logout AND the GraphQL payload carries a timestamped
@@ -13,13 +22,15 @@ Filters come from projects.json, never from the caller, so this cannot be pointe
 findings outside the registry.
 
 Exit codes: 0 success (INCLUDING a genuinely empty finding list), 2 auth/network,
-3 unknown project or no asset in scope resolves, 4 config missing.
+3 unknown project or no asset in scope resolves (or, for deactivate, no record of that
+CVE in scope), 4 config missing, 5 Vanta refused to deactivate one or more records.
 
 Exit 0 always prints a JSON array in --json mode, so the caller can tell "no open
 findings" from "the lookup failed" — previously a stale asset name aborted the whole
 project with empty stdout and the agent could not distinguish the two.
 """
 
+import datetime
 import json
 import os
 import pathlib
@@ -36,6 +47,7 @@ CLIENT_SECRET = os.environ.get("VANTA_CLIENT_SECRET", "")
 # four levels. Override with VANTA_SEVERITIES="CRITICAL,HIGH" if you ever need to narrow.
 SEVERITIES = [s.strip() for s in
               os.environ.get("VANTA_SEVERITIES", "CRITICAL,HIGH,MEDIUM,LOW").split(",") if s.strip()]
+REVIEW_DAYS = int(os.environ.get("EXCEPTION_REVIEW_DAYS", "30"))
 
 
 def die(msg, code=1):
@@ -53,6 +65,10 @@ def post_json(url, payload, headers=None):
         return json.load(r)
 
 
+def post_auth(url, payload, token):
+    return post_json(url, payload, {"Authorization": f"Bearer {token}"})
+
+
 def get_json(url, token):
     req = urllib.request.Request(
         url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"}
@@ -61,7 +77,7 @@ def get_json(url, token):
         return json.load(r)
 
 
-def get_token():
+def get_token(write=False):
     if not CLIENT_ID or not CLIENT_SECRET:
         die(
             "VANTA_CLIENT_ID / VANTA_CLIENT_SECRET are not set.\n"
@@ -75,7 +91,8 @@ def get_token():
             {
                 "client_id": CLIENT_ID,
                 "client_secret": CLIENT_SECRET,
-                "scope": "vanta-api.all:read",
+                "scope": "vanta-api.all:read vanta-api.all:write" if write
+                         else "vanta-api.all:read",
                 "grant_type": "client_credentials",
             },
         )
@@ -213,6 +230,84 @@ def check_registry(projects):
     return 0
 
 
+def collect(token, cfg, deactivated=False):
+    base = {"isDeactivated": "true" if deactivated else "false"}
+    if cfg.get("integrationId"):
+        base["integrationId"] = cfg["integrationId"]
+
+    # Filter by asset on the SERVER via vulnerableAssetId — the vuln record's targetId is
+    # NOT reliably the asset id (it matched for one image by luck, not for others), so any
+    # client-side id match is wrong. Let Vanta resolve the asset->finding relationship.
+    asset_ids = resolve_assets(token, cfg["assets"]) if cfg.get("assets") else [None]
+
+    found = []
+    for aid in asset_ids:
+        p = dict(base)
+        if aid:
+            p["vulnerableAssetId"] = aid
+        for sev in SEVERITIES:
+            found.extend(fetch(token, dict(p, severity=sev)))
+
+    found.sort(key=lambda v: (v.get("severity") != "CRITICAL", v.get("remediateByDate") or ""))  # CRITICAL first, then soonest SLA
+    return found
+
+
+def matches(v, cve):
+    """Vanta names a GHSA record "GHSA-xxxx - next", a CVE record just "CVE-…"."""
+    n = (v.get("name") or "").strip()
+    return v.get("id") == cve or n == cve or n.split(" - ")[0].strip() == cve
+
+
+def deactivate(name, cfg, rest):
+    """Deactivate every in-scope record of one CVE. Only records this project's own
+    findings list returns are touched, so it cannot reach outside the registry."""
+    argv = list(rest)
+    indefinite = "--indefinite" in argv
+    argv = [a for a in argv if a != "--indefinite"]
+    reason = None
+    if "--reason" in argv:
+        i = argv.index("--reason")
+        reason = argv[i + 1] if i + 1 < len(argv) else None
+        del argv[i:i + 2]
+    if len(argv) != 1 or not reason:
+        die("usage: vanta-findings <project> deactivate <CVE> --reason \"...\" [--indefinite]")
+    cve = argv[0]
+
+    token = get_token(write=True)
+    targets = [v for v in collect(token, cfg) if matches(v, cve)]
+    if not targets:
+        die(f"no active record of {cve} in {name}'s scope — nothing to deactivate "
+            "(already deactivated? check with --deactivated)", 3)
+
+    until = None
+    if not indefinite:
+        until = (datetime.datetime.now(datetime.timezone.utc)
+                 + datetime.timedelta(days=REVIEW_DAYS)).strftime("%Y-%m-%dT00:00:00.000Z")
+    failed = 0
+    for i in range(0, len(targets), 50):  # the endpoint takes at most 50 per call
+        updates = []
+        for v in targets[i:i + 50]:
+            u = {"id": v["id"], "deactivateReason": reason,
+                 "shouldReactivateWhenFixable": not indefinite}
+            if until:
+                u["deactivateUntilDate"] = until
+            updates.append(u)
+        try:
+            body = post_auth(f"{BASE}/v1/vulnerabilities/deactivate", {"updates": updates}, token)
+        except urllib.error.HTTPError as e:
+            die(f"Vanta refused the deactivation (HTTP {e.code}): {e.read()[:300]!r}", 2)
+        except Exception as e:  # noqa: BLE001
+            die(f"could not reach Vanta: {e}", 2)
+        for r in body.get("results", []):
+            ok = r.get("status") == "SUCCESS"
+            failed += not ok
+            print(f"  {'ok  ' if ok else 'FAIL'} {r.get('id')} {r.get('message') or ''}".rstrip())
+    print(f"deactivated {len(targets) - failed}/{len(targets)} record(s) of {cve} — "
+          + (f"until {until[:10]}, lifts early once a fix exists" if until
+             else "indefinitely (no end date, no auto-lift)"))
+    return 5 if failed else 0
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     as_json = "--json" in sys.argv
@@ -239,26 +334,13 @@ def main():
         # To stderr so it never corrupts the --json array on stdout, but the agent still sees it.
         tags = ", ".join(f"{o.get('name','?')} <@{o['slack_id']}>" for o in owners if o.get("slack_id"))
         print(f"owners: {tags}", file=sys.stderr)
+
+    if len(args) > 1 and args[1] == "deactivate":
+        # The raw argv, not `args`: that drops the --flags but keeps their values.
+        sys.exit(deactivate(name, cfg, sys.argv[sys.argv.index("deactivate") + 1:]))
+
     token = get_token()
-
-    base = {"isDeactivated": "false"}
-    if cfg.get("integrationId"):
-        base["integrationId"] = cfg["integrationId"]
-
-    # Filter by asset on the SERVER via vulnerableAssetId — the vuln record's targetId is
-    # NOT reliably the asset id (it matched for one image by luck, not for others), so any
-    # client-side id match is wrong. Let Vanta resolve the asset->finding relationship.
-    asset_ids = resolve_assets(token, cfg["assets"]) if cfg.get("assets") else [None]
-
-    found = []
-    for aid in asset_ids:
-        p = dict(base)
-        if aid:
-            p["vulnerableAssetId"] = aid
-        for sev in SEVERITIES:
-            found.extend(fetch(token, dict(p, severity=sev)))
-
-    found.sort(key=lambda v: (v.get("severity") != "CRITICAL", v.get("remediateByDate") or ""))  # CRITICAL first, then soonest SLA
+    found = collect(token, cfg, deactivated="--deactivated" in sys.argv)
 
     if as_json:
         print(json.dumps(found, indent=2))
