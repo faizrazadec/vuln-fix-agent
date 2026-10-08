@@ -4,7 +4,9 @@ An [A2A (Agent2Agent)](https://a2a-protocol.org) server that exposes Claude Code
 agent for fixing security vulnerabilities. A caller sends a JSON-RPC `SendMessage` such as
 `fix vulns in <project>`. The server runs a real Claude Code session that pulls the project's
 findings from Vanta, patches the repo, rebuilds and scans the image, runs the test suite, and
-opens a signed pull request. It reports the result to Slack.
+opens a signed pull request. It reports the result to Slack. Findings with no reachable fix
+are deactivated in Vanta as time-boxed exceptions, and every exception and every
+Critical/High fix PR is tracked in a Linear ticket assigned to the project owner.
 
 A cron job runs every registered project on weekday nights, one at a time.
 
@@ -17,7 +19,8 @@ cron ──> scripts/VulnFixAgent ──> scripts/ask.sh ──JSON-RPC──> a
                                                                      │
                                                     skills/vuln-fix/SKILL.md pipeline:
                           Vanta findings → clone → triage → baseline → fix → rebuild +
-                          trivy scan + tests → PR or Slack note → JSON run summary
+                          trivy scan + tests → PR or Vanta exception → Linear ticket
+                          → Slack note → JSON run summary
 ```
 
 - **`app/main.py`**: the whole server. It bridges the A2A task lifecycle to the Claude Agent
@@ -26,8 +29,11 @@ cron ──> scripts/VulnFixAgent ──> scripts/ask.sh ──JSON-RPC──> a
 - **`app/skills/vuln-fix/SKILL.md`**: the fix pipeline, written as instructions rather than
   orchestration code.
 - **`app/bin/`**: CLI tools the agent calls:
-  - `vanta-findings`: fetches open findings for a project
-  - `vuln-ledger`: tracks CVEs already fixed or already reported
+  - `vanta-findings`: fetches open findings for a project, and deactivates one
+    (`deactivate <CVE> --reason …`)
+  - `vuln-ledger`: tracks CVEs already fixed or already reported, and the ticket each is
+    tracked under
+  - `linear-ticket`: creates, links, extends and closes the compliance tickets
   - `slack-notify`: posts to Slack through an incoming webhook
   - `vuln-report`: a 30-day rollup of CVEs fixed, PRs opened, cost, and anything that needs
     a look
@@ -39,7 +45,9 @@ cron ──> scripts/VulnFixAgent ──> scripts/ask.sh ──JSON-RPC──> a
 - A Claude subscription. Billing goes through an interactive `claude` login, not
   `ANTHROPIC_API_KEY`.
 - A GitHub SSH key for push and signing, plus a fine-grained PAT for opening PRs
-- Vanta API credentials and a Slack incoming webhook
+- Vanta API credentials with **write** scope (the agent deactivates findings), and a Slack
+  incoming webhook
+- A Linear API key, plus the team and project the compliance tickets go to
 - [uv](https://docs.astral.sh/uv/) and Python 3.14+, only for running the tests
 
 ## Setup
@@ -65,7 +73,7 @@ Each key in `app/projects.json` is the name a caller uses. Fields:
 |---|---|---|
 | `repo` | yes | SSH clone URL |
 | `vanta.assets` | yes | Vanta vulnerable-asset names to pull findings for |
-| `owners` | yes | `{name, slack_id}` entries tagged in every Slack message |
+| `owners` | yes | `{name, slack_id, linear_id}` entries. Everyone is tagged in every Slack message; the first owner is assigned the Linear tickets |
 | `base_branch` | no | Fixed PR base. If omitted, the agent tries `staging`, then `develop`, then `main` |
 | `base_branch_reason` | no | Why the base is pinned |
 
@@ -76,6 +84,24 @@ name still resolves:
 ```bash
 docker compose exec -u agent vuln-fix-agent vanta-findings --check-registry
 ```
+
+### Compliance tickets
+
+Two ISO controls drive this: every risk-relevant Critical/High vulnerability has a ticket
+assigned to the system owner, and every exception has a remediation plan and review date.
+
+| Situation | Vanta | Linear |
+|---|---|---|
+| No fix exists | Deactivated for `EXCEPTION_REVIEW_DAYS` (30); lifts early when Vanta sees a fix | Backlog ticket per package: CVEs, reason, risk treatment, due on the review date |
+| Vanta lists a fix that cannot be applied (vendored binary, net regression) | Deactivated with no end date, since Vanta would otherwise keep re-raising it | Same, and the ticket's due date is the only review trigger |
+| Fix PR touches a Critical/High finding | Nothing to do | One ticket linked to the PR, or the existing exception ticket reused |
+
+`scripts/VulnFixAgent` closes a ticket when its PR merges (`linear-ticket sync`), because
+Linear's GitHub integration is not assumed. It also starts a run when an exception's
+review date arrives, even if Vanta shows no open findings. A deactivated finding does not
+appear in `vanta-findings`, so the review date is what brings it back. A review that finds
+no fix extends the deactivation and the due date by another 30 days.
+`linear-ticket` only edits issues in `LINEAR_PROJECT_ID`.
 
 ## Usage
 
@@ -91,6 +117,16 @@ docker compose logs -f vuln-fix-agent
 
 To schedule the nightly batch, install [deploy/crontab](deploy/crontab) with `crontab -e`.
 Batch output goes to `vuln-run.log`.
+
+## Changelog
+
+Significant changes get one file under [changelog/entries/](changelog/entries/); the rules
+are in [changelog/README.md](changelog/README.md). Enable the hook that validates them, once
+per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
 
 ## Tests
 
