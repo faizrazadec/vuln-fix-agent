@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""Linear tickets for the compliance register: one per fix PR, one per Vanta exception.
+
+    linear-ticket create <project> --kind fix|exception --title "..." --severity CRITICAL
+                         --body-file f.md [--due YYYY-MM-DD]
+    linear-ticket link <ISSUE> <url> [--title "..."]      # attach a PR to the ticket
+    linear-ticket comment <ISSUE> "text"                  # or --body-file f.md
+    linear-ticket due <ISSUE> YYYY-MM-DD                  # move the review date
+    linear-ticket close <ISSUE> ["comment"]
+    linear-ticket sync <project>                          # close tickets whose PR merged
+
+`create` assigns the project's first owner (by the `linear_id` in projects.json) and
+subscribes the rest. A fix ticket starts in review, since its PR already exists; an
+exception ticket goes to the backlog with a due date EXCEPTION_REVIEW_DAYS (30) out
+unless --due says otherwise. Both land in LINEAR_PROJECT_ID on LINEAR_TEAM_ID.
+
+`sync` is what closes a ticket on merge — Linear's GitHub integration is not installed,
+so nothing else would. The batch runner calls it for every project before its
+pre-filter, because a project whose fix merged usually has no findings left and would
+never get a session to notice.
+
+Every command that touches an existing issue first checks that it belongs to
+LINEAR_PROJECT_ID, so the agent cannot edit tickets outside the register.
+
+Exit codes: 0 ok; 2 API/network; 3 unknown project, owner without linear_id, or an issue
+outside the register; 4 not configured.
+"""
+
+import datetime
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+REGISTRY = pathlib.Path(__file__).resolve().parent.parent / "projects.json"
+STATE_DIR = pathlib.Path(os.environ.get("STATE_DIR", "/home/agent/state"))
+API = os.environ.get("LINEAR_API_URL", "https://api.linear.app/graphql")
+KEY = os.environ.get("LINEAR_API_KEY", "")
+TEAM = os.environ.get("LINEAR_TEAM_ID", "")
+PROJECT = os.environ.get("LINEAR_PROJECT_ID", "")
+REVIEW_DAYS = int(os.environ.get("EXCEPTION_REVIEW_DAYS", "30"))
+PRIORITY = {"CRITICAL": 1, "HIGH": 2, "MEDIUM": 3, "LOW": 4}
+# Preferred state names, falling back to the first state of the right type.
+STATES = {"fix": ("Internal Review", "started"), "exception": ("Backlog", "backlog"),
+          "done": ("Done", "completed")}
+
+
+def die(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def gql(query, variables=None):
+    if not (KEY and TEAM and PROJECT):
+        die("Linear is not configured. Set LINEAR_API_KEY, LINEAR_TEAM_ID and "
+            "LINEAR_PROJECT_ID in .env.", 4)
+    req = urllib.request.Request(
+        API,
+        data=json.dumps({"query": query, "variables": variables or {}}).encode(),
+        headers={"Content-Type": "application/json", "Authorization": KEY},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            body = json.load(r)
+    except urllib.error.HTTPError as e:
+        die(f"Linear returned HTTP {e.code}: {e.read()[:300]!r}", 2)
+    except Exception as e:  # noqa: BLE001
+        die(f"could not reach Linear: {e}", 2)
+    if body.get("errors"):
+        msg = body["errors"][0].get("message", body["errors"])
+        # An unknown issue id is the caller's mistake, not an outage.
+        die(f"Linear API error: {msg}", 3 if "not found" in str(msg).lower() else 2)
+    return body["data"]
+
+
+def opt(args, name):
+    if name not in args:
+        return None
+    i = args.index(name)
+    if i + 1 >= len(args):
+        die(f"{name} needs a value")
+    value = args[i + 1]
+    del args[i:i + 2]
+    return value
+
+
+def state_id(kind):
+    want, typ = STATES[kind]
+    nodes = gql("query($t:String!){team(id:$t){states{nodes{id name type}}}}",
+                {"t": TEAM})["team"]["states"]["nodes"]
+    for n in nodes:
+        if n["name"] == want:
+            return n["id"]
+    for n in nodes:
+        if n["type"] == typ:
+            return n["id"]
+    die(f"team has no '{want}' state and no state of type {typ}", 2)
+
+
+def issue(ident):
+    """The issue, refusing anything outside the register project."""
+    d = gql("query($id:String!){issue(id:$id){id identifier url project{id} "
+            "state{type}}}", {"id": ident})
+    i = d.get("issue")
+    if not i or (i.get("project") or {}).get("id") != PROJECT:
+        die(f"{ident} is not a ticket in the vulnerability register project", 3)
+    return i
+
+
+def load_projects():
+    if not REGISTRY.exists():
+        die(f"missing {REGISTRY}", 4)
+    return {k: v for k, v in json.loads(REGISTRY.read_text()).items() if isinstance(v, dict)}
+
+
+def comment(issue_id, body):
+    gql("mutation($i:CommentCreateInput!){commentCreate(input:$i){success}}",
+        {"i": {"issueId": issue_id, "body": body}})
+
+
+def cmd_create(args):
+    kind, title = opt(args, "--kind"), opt(args, "--title")
+    severity = (opt(args, "--severity") or "").upper()
+    body_file, due = opt(args, "--body-file"), opt(args, "--due")
+    if len(args) != 1 or kind not in ("fix", "exception") or not title or not body_file:
+        die("usage: linear-ticket create <project> --kind fix|exception --title T "
+            "--severity S --body-file F [--due YYYY-MM-DD]")
+    projects = load_projects()
+    name = args[0]
+    if name not in projects:
+        die(f"'{name}' is not a registered project", 3)
+    owners = [o for o in projects[name].get("owners") or [] if o.get("linear_id")]
+    if not owners:
+        die(f"no owner of {name} has a linear_id in projects.json — cannot assign", 3)
+    if kind == "exception" and not due:
+        due = (datetime.date.today() + datetime.timedelta(days=REVIEW_DAYS)).isoformat()
+    try:
+        body = pathlib.Path(body_file).read_text()
+    except OSError as e:
+        die(f"cannot read {body_file}: {e}")
+
+    inp = {
+        "teamId": TEAM, "projectId": PROJECT, "title": title, "description": body,
+        "assigneeId": owners[0]["linear_id"],
+        "subscriberIds": [o["linear_id"] for o in owners],
+        "stateId": state_id(kind),
+        "priority": PRIORITY.get(severity, 0),
+    }
+    if due:
+        inp["dueDate"] = due
+    d = gql("mutation($i:IssueCreateInput!){issueCreate(input:$i){success "
+            "issue{identifier url dueDate}}}", {"i": inp})
+    i = d["issueCreate"]["issue"]
+    print(json.dumps({"identifier": i["identifier"], "url": i["url"], "due": i.get("dueDate")}))
+
+
+def cmd_link(args):
+    title = opt(args, "--title")
+    if len(args) != 2:
+        die("usage: linear-ticket link <ISSUE> <url> [--title T]")
+    i = issue(args[0])
+    gql("mutation($i:String!,$u:String!,$t:String){attachmentLinkURL(issueId:$i,url:$u,"
+        "title:$t){success}}", {"i": i["id"], "u": args[1], "t": title})
+    print(f"linked {args[1]} to {i['identifier']}")
+
+
+def cmd_comment(args):
+    body_file = opt(args, "--body-file")
+    if not args or (len(args) < 2 and not body_file):
+        die("usage: linear-ticket comment <ISSUE> \"text\" | --body-file F")
+    body = pathlib.Path(body_file).read_text() if body_file else " ".join(args[1:])
+    i = issue(args[0])
+    comment(i["id"], body)
+    print(f"commented on {i['identifier']}")
+
+
+def cmd_due(args):
+    if len(args) != 2:
+        die("usage: linear-ticket due <ISSUE> YYYY-MM-DD")
+    try:
+        datetime.date.fromisoformat(args[1])
+    except ValueError:
+        die(f"not a date: {args[1]!r}")
+    i = issue(args[0])
+    gql("mutation($id:String!,$d:TimelessDate){issueUpdate(id:$id,input:{dueDate:$d})"
+        "{success}}", {"id": i["id"], "d": args[1]})
+    print(f"{i['identifier']} due {args[1]}")
+
+
+def close(ident, note=None):
+    i = issue(ident)
+    if note:
+        comment(i["id"], note)
+    if i["state"]["type"] not in ("completed", "canceled"):
+        gql("mutation($id:String!,$s:String!){issueUpdate(id:$id,input:{stateId:$s})"
+            "{success}}", {"id": i["id"], "s": state_id("done")})
+    return i["identifier"]
+
+
+def cmd_close(args):
+    if not args:
+        die("usage: linear-ticket close <ISSUE> [\"comment\"]")
+    print(f"closed {close(args[0], ' '.join(args[1:]) or None)}")
+
+
+def ledger(*args):
+    return subprocess.run([str(pathlib.Path(__file__).with_name("vuln-ledger")), *args],
+                          capture_output=True, text=True)
+
+
+def pr_state(url):
+    m = re.match(r"https://github\.com/([^/]+/[^/]+)/pull/(\d+)", url or "")
+    if not m:
+        return None
+    r = subprocess.run(["gh", "api", f"repos/{m[1]}/pulls/{m[2]}", "-q",
+                        "if .merged then \"MERGED\" else .state end"],
+                       capture_output=True, text=True)
+    return r.stdout.strip().upper() if r.returncode == 0 else None
+
+
+def cmd_sync(args):
+    if len(args) != 1:
+        die("usage: linear-ticket sync <project>")
+    r = ledger(args[0], "tickets", "--open")
+    if r.returncode != 0:
+        die(r.stderr.strip() or "could not read the ledger", r.returncode)
+    closed = reopened = 0
+    for t in json.loads(r.stdout):
+        if not t.get("pr"):
+            continue
+        state = pr_state(t["pr"])
+        if state == "MERGED":
+            close(t["issue"], f"Fix PR merged: {t['pr']}. Closing.")
+            ledger(args[0], "close-ticket", t["issue"])
+            print(f"  {t['issue']}: PR merged — closed")
+            closed += 1
+        elif state == "CLOSED":
+            # Not merged: the vulnerability is still open, so the ticket is too. Drop the
+            # dead PR so the next run fixes it again and links the new one.
+            comment(issue(t["issue"])["id"],
+                    f"Fix PR {t['pr']} was closed without merging. The vulnerability is "
+                    "still open; the next agent run will retry it.")
+            ledger(args[0], "add-ticket", t["issue"], "--kind", t["kind"],
+                   "--cves", ",".join(t.get("cves") or []), "--pr", "none")
+            print(f"  {t['issue']}: PR closed unmerged — ticket kept open")
+            reopened += 1
+        elif state is None:
+            print(f"  {t['issue']}: could not read PR state for {t['pr']}", file=sys.stderr)
+    print(f"sync {args[0]}: {closed} closed, {reopened} PR(s) closed unmerged")
+
+
+def main():
+    argv = sys.argv[1:]
+    cmds = {"create": cmd_create, "link": cmd_link, "comment": cmd_comment,
+            "due": cmd_due, "close": cmd_close, "sync": cmd_sync}
+    if not argv or argv[0] not in cmds:
+        die(f"usage: linear-ticket {{{'|'.join(cmds)}}} ...")
+    cmds[argv[0]](argv[1:])
+
+
+if __name__ == "__main__":
+    main()

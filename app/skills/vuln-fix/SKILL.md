@@ -1,6 +1,6 @@
 ---
 name: vuln-fix
-description: Clone a registered repository, branch from staging/develop, and remediate the vulnerabilities Vanta reports for its assets. For each fixable finding, apply the fix and verify BOTH the test suite and the rebuilt Docker image still pass; open a signed PR only if nothing broke. Post to Slack when a fix breaks tests or a finding is unfixable. Use whenever a caller asks to fix vulnerabilities, patch CVEs, remediate a security scan, or bump vulnerable dependencies for a project.
+description: Clone a registered repository, branch from staging/develop, and remediate the vulnerabilities Vanta reports for its assets. For each fixable finding, apply the fix and verify BOTH the test suite and the rebuilt Docker image still pass; open a signed PR only if nothing broke. Deactivate unfixable findings in Vanta as time-boxed exceptions, and track every exception and every Critical/High fix PR in a Linear ticket assigned to the owner. Post to Slack when a fix breaks tests, a PR opens, or a finding is deactivated. Use whenever a caller asks to fix vulnerabilities, patch CVEs, remediate a security scan, or bump vulnerable dependencies for a project.
 ---
 
 You are a vulnerability-remediation agent. A caller names a registered project. Work
@@ -13,8 +13,8 @@ already bound to that channel (Slack mrkdwn: `<url|text>` links, `<@U…>` menti
 not use a connected Slack MCP tool (`slack_send_message` etc.)** — it posts as the human
 whose claude.ai login this is, not as the bot. `vanta-findings <project> --json` and the registry also give the
 project **owners** (a list of name + `slack_id`). Tag every owner as `<@slack_id>` at the start of
-EVERY message to this channel — each one is an action item for them (review a PR,
-deactivate a finding in Vanta, or investigate a broken fix). Keep every message to 1–3 lines.
+EVERY message to this channel — each one is an action item for them (review a PR, review
+an exception you made in Vanta, or investigate a broken fix). Keep every message to 1–3 lines.
 `slack-notify` prints `sent` and exits 0 on delivery; any other exit means the message was
 not delivered — say so in your final report and never assume it was sent.
 
@@ -29,6 +29,18 @@ runs before (processes vanish with no summary). So:
 - **Never build with `--no-cache`.** Rely on Docker's layer cache so a rebuild only
   re-installs the dependency you changed, not the whole tree — the install/build otherwise
   runs twice (host tests, then `docker build`). Do not bust the cache unnecessarily.
+
+**Compliance tickets — every one of these is an ISO control, not a nicety.** Two kinds,
+both in Linear via `linear-ticket` (never a Linear MCP tool — it is blocked), both
+assigned to the project's owner automatically:
+- **fix** — one per fix PR that fixes any CRITICAL or HIGH finding. Links the PR; closed
+  for you when the PR merges (the batch runner syncs merges — do not close it yourself).
+- **exception** — one per package you deactivate in Vanta for lack of a fix, with the
+  reason and a review date. Stays open until a fix is available AND applied.
+Record every ticket in the ledger (`vuln-ledger <project> add-ticket …`) the moment you
+create or change it — the ledger is what stops the next run creating a duplicate, and
+what keeps open tickets in step with the vulnerability register. A ticket you could not
+create (non-zero exit) is a failure to report, never something to paper over.
 
 ## Steps
 
@@ -84,13 +96,29 @@ runs before (processes vanish with no summary). So:
       skip a finding because a Dependabot PR exists for it (they routinely target the wrong
       branch or skip the lockfile). Fix every finding yourself, in your PR.
 
-   c. **Already notified unfixable** — for an unfixable finding (6a), run
-      `vuln-ledger <project> notified <CVE> --fixed-version <fixedVersion|none>`, passing
-      the version Vanta reports *right now*. Exit 0 means nothing has changed since you
-      Slacked it, so **do not Slack again** — collect it into an "unfixable, already
-      notified" list. **Exit 1 means the suppression has lifted** and the finding is live
-      work again: either a patch appeared since (the ledger prints the before/after on
-      stderr) or the entry aged out. Re-evaluate from scratch — if it is fixable now, fix it.
+   c. **Already has a ticket** — `vuln-ledger <project> ticket-for <CVE>`. Exit 0 prints
+      the open ticket. A deactivated finding normally does not appear in your list at all,
+      so one that DOES has come back: Vanta lifted the exception because a fix shipped or
+      the 30 days ran out. Re-evaluate it from scratch — fixable now → fix it (6b) and in
+      step 8 link the PR to **that** ticket rather than creating a new one; still
+      unfixable → handle it as a due review (4d). Never create a second ticket for a CVE
+      that already has an open one.
+
+   d. **Exception reviews that are due** — `vuln-ledger <project> tickets --due` lists
+      exception tickets whose review date has come (the batch runner dispatches a run for
+      these even when Vanta shows nothing, because a deactivated finding is invisible to
+      `vanta-findings`). For each, look the CVEs up with
+      `vanta-findings <project> --json --deactivated` (and in the active list, in case
+      Vanta already lifted it) and re-check reachability as in 6a:
+      - **A fix is now reachable** → it is live work: fix it in this run (6b) and link the
+        PR to this ticket in step 8. If the record is still deactivated in Vanta, leave it —
+        once the PR merges and the image rebuilds, the finding resolves on its own.
+      - **Still no reachable fix** → if Vanta reactivated it, deactivate it again exactly as
+        in 6a. Then extend the review, all three:
+        `linear-ticket comment <ISSUE> "Reviewed <today>: still no reachable fix — <why>. Next review <date>."`,
+        `linear-ticket due <ISSUE> <today + 30 days>`, and
+        `vuln-ledger <project> add-ticket <ISSUE> --kind exception --cves <CVEs> --review-date <same date>`.
+        No Slack message for a routine extension — the ticket comment is the record.
 
    Only findings that survive triage — genuinely new, fixable, no open PR — go on to the
    work below. If nothing survives, skip straight to the report: clone was cheap, and you
@@ -115,25 +143,57 @@ runs before (processes vanish with no summary). So:
 
 6. **Work through the surviving findings one at a time.** For each:
 
-   a. **Unfixable?** A finding is unfixable when it has no patched version
-      (`isFixable: false`, or `fixedVersion` is null / "NotAvailable"), OR when Vanta lists a
-      fix but it is **unreachable in practice** — the CVE ships inside a vendored binary or a
-      pinned transitive you cannot bump (e.g. alkaline3's `go/stdlib` / `golang.org/x/text`
-      CVEs ride in the tsgo binary that `@typescript/native-preview` ships, so no dep bump
-      reaches the patched Go). Do not touch it. Post to Slack:
-      `send to #development-and-pr-reviews: ":warning: <@owner1> <@owner2 …> <project>: <package> <CVE> has no reachable fix yet — please deactivate it in Vanta until one ships."`
-      **Name it exactly as Vanta does** — its `packageIdentifier` + CVE `name` from
-      `vanta-findings` (e.g. `go/stdlib:1.26.2 CVE-2026-39821`), because the owner has to search
-      Vanta to deactivate it and Vanta only knows that name. NEVER name it by root cause alone
-      ("the tsgo binary in @typescript/native-preview") — that string is not in Vanta, so the
-      owner can't find it; put the root cause as a trailing clause AFTER the Vanta identifier if
-      it explains WHY the fix is unreachable. And **list every finding individually** by its
-      Vanta identifier — never a rollup like "10 go/stdlib CVEs (incl. …)", which leaves the
-      unnamed ones un-actionable.
-      Then record it so future runs stay quiet — **with the version Vanta currently
-      reports**, so the quiet ends by itself the day a patch ships:
-      `vuln-ledger <project> add-notified <CVE> --fixed-version <fixedVersion|none> --reason "<why the fix is unreachable>"`
-      Move on. (Triage step 4c already filtered out ones you notified on a prior run.)
+   a. **Unfixable? Deactivate it in Vanta yourself, ticket it, then tell the owner.**
+      Every severity, not just CRITICAL/HIGH. Two kinds, and they deactivate differently:
+      - **No fix exists** — `isFixable: false`, or `fixedVersion` null / "NotAvailable".
+        `vanta-findings <project> deactivate <CVE> --reason "<reason>"` — a 30-day
+        exception that also lifts by itself the moment Vanta sees a fix.
+      - **Vanta lists a fix, but it is unreachable in practice** — the CVE ships inside a
+        vendored binary or a pinned transitive you cannot bump (e.g. alkaline3's
+        `go/stdlib` / `golang.org/x/text` CVEs ride in the tsgo binary that
+        `@typescript/native-preview` ships, so no dep bump reaches the patched Go), or the
+        only fix is a net regression (step 7).
+        `vanta-findings <project> deactivate <CVE> --reason "<reason>" --indefinite` — no
+        end date in Vanta, because Vanta already considers it fixable and would otherwise
+        keep re-raising it. The Linear ticket carries the 30-day review instead.
+      Pass the CVE as `vanta-findings` names it (`CVE-…` or `GHSA-…`); the command
+      deactivates every record of it in this project's scope (usually one per image) and
+      exits 0 only if all succeeded. The reason is what an auditor reads in Vanta — make it
+      specific: `"No fixed version upstream (Debian libxml2 2.9.14). Tracked in Linear,
+      review in 30 days."` Deactivate first, then create the ticket — the ticket records
+      the deactivation, so it has to have happened.
+
+      **Then one exception ticket per package** (group that package's CVEs from this run,
+      but list each CVE individually — never a rollup). Skip CVEs that already have an
+      open ticket (4c). Write the body to a file and:
+      `linear-ticket create <project> --kind exception --severity <highest severity among them> --title "<project>: <packageIdentifier> — <N> CVE(s) deactivated, no reachable fix" --body-file <f>`
+      The body must carry everything the compliance control asks for:
+      - every CVE, named exactly as Vanta does (`packageIdentifier` + `name`), with
+        severity and Vanta's `fixedVersion`;
+      - **why it was deferred** — no upstream fix, or the root cause that makes the listed
+        fix unreachable;
+      - **risk treatment** — what keeps the risk acceptable meanwhile (not reachable from
+        user input, behind auth, the vulnerable path unused…) as far as you can tell from
+        the code, or "not assessed — owner to assess" when you cannot;
+      - how it was deactivated in Vanta (30-day exception, or indefinite) and the date;
+      - **the review date** — `create` sets it as the due date (today + 30 days) and
+        prints it; state it in the body too.
+      `create` prints `{"identifier","url","due"}`. Record it:
+      `vuln-ledger <project> add-ticket <ISSUE> --kind exception --cves <CVE1,CVE2> --url <url> --review-date <due> --vanta until|indefinite`
+      and keep the ledger's notification record in step, with the version Vanta reports now:
+      `vuln-ledger <project> add-notified <CVE> --fixed-version <fixedVersion|none> --reason "<why>"`
+
+      **Then Slack, one message per project run** listing what you deactivated:
+      `":no_entry_sign: <@owner1> <@owner2 …> <project>: deactivated in Vanta — <packageIdentifier> <CVE>, <packageIdentifier> <CVE> … (<no fix upstream | fix unreachable: reason>). Review ticket <url|EMB-123> due <date>."`
+      **Name every finding exactly as Vanta does** — its `packageIdentifier` + CVE `name`
+      (e.g. `go/stdlib:1.26.2 CVE-2026-39821`), never by root cause alone ("the tsgo binary
+      in @typescript/native-preview"); put the root cause as a trailing clause. List every
+      finding individually.
+
+      If `deactivate` fails (non-zero), do NOT create the ticket as though it had worked:
+      create it anyway (the risk still needs tracking), say in its body and in Slack that
+      the Vanta deactivation failed and the owner must do it by hand, and report it.
+      Move on.
 
    b. **Fixable:** bump the dependency to `fixedVersion`, then **regenerate the lockfile the
       build actually installs from** — this is where fixes are won or lost. The deployed image
@@ -201,8 +261,8 @@ runs before (processes vanish with no summary). So:
    **A gate blocker with no *reachable* fix is not automatically a Vanta-deactivation.** When
    you cannot clear one (no patched version, or the fix lives in a vendored binary / pinned
    transitive), decide by whether it is in the Vanta list (`vanta-findings <project>`):
-   - **In Vanta** → notify per 6a, named by Vanta's `packageIdentifier` + CVE so the owner can
-     deactivate it (`go/stdlib:1.26.2 CVE-2026-39821`, not "the tsgo binary").
+   - **In Vanta** → handle it per 6a: deactivate (`--indefinite` when Vanta lists a fix you
+     cannot reach), exception ticket, Slack.
    - **Not in Vanta** (Trivy scans things Vanta doesn't) → do NOT tell the owner to "deactivate
      it in Vanta" — there is nothing there to deactivate. Flag it as a gate heads-up in the PR
      body and Slack (":warning: the Security Central gate is red on `<package> <CVE>` — no
@@ -220,13 +280,13 @@ runs before (processes vanish with no summary). So:
    equal or higher severity — e.g. `pip 26.2.1` clears its CVEs but vendors a newer
    `setuptools`/`msgpack` that Trivy flags as HIGH. Compare the rebuilt image's findings to
    the baseline: if a bump adds findings ≥ the severity it removed, it is a **net
-   regression** — revert that specific bump and treat that finding as having **no safe fix**
-   (notify like an unfixable finding, 6a wording adapted: "<package> <CVE>: the only
-   available fix (<version>) introduces new <severity> findings via <vendored/transitive
-   dep> — a net regression, not applied. Please deactivate it in Vanta or review manually."
-   then `vuln-ledger <project> add-notified <CVE> --fixed-version <the regressing version>
+   regression** — revert that specific bump and treat that finding as having **no safe fix**:
+   handle it per 6a with `--indefinite` (Vanta lists a fix, it just is not safe to apply),
+   reason "the only available fix (<version>) introduces new <severity> findings via
+   <vendored/transitive dep> — net regression, not applied", and record
+   `vuln-ledger <project> add-notified <CVE> --fixed-version <the regressing version>
    --reason "net regression"` — recording the version that regressed means the next version
-   to ship lifts the suppression by itself). Keep the clean bumps.
+   to ship lifts the suppression by itself. Keep the clean bumps.
 
 8. **Decide, per the verification result:**
 
@@ -254,6 +314,26 @@ runs before (processes vanish with no summary). So:
        the configured base:
        ` :rotating_light: heads-up: this PR targets \`main\` (the configured base for this project — <reason>) — review extra carefully before merging.`
      Then record each fixed CVE: `vuln-ledger <project> add-resolved <CVE> <pr-url>`.
+
+     **Then the fix ticket**, if this PR fixes any CRITICAL or HIGH finding (MEDIUM/LOW-only
+     PRs need none — unless one of them already has an exception ticket, below):
+     - **A CVE in this PR already has an open ticket** (`vuln-ledger <project> ticket-for
+       <CVE>` — an exception ticket whose fix finally shipped, or this PR's own ticket from
+       an earlier run): reuse it. `linear-ticket link <ISSUE> <pr-url> --title "Fix PR"`,
+       `linear-ticket comment <ISSUE> "Fix available and applied in <pr-url>: <CVEs, before → after>."`,
+       then `vuln-ledger <project> add-ticket <ISSUE> --kind fix --cves <CVEs> --pr <pr-url>`.
+       An exception ticket becomes a fix ticket this way, and closes when the PR merges.
+     - **If you adopted an existing PR**, its ticket is the ledger entry whose `pr` is that
+       URL (`vuln-ledger <project> tickets --open`): link nothing new, comment the CVEs you
+       added, and `add-ticket` them onto it.
+     - **Otherwise create one ticket for the PR:** body file listing each CRITICAL/HIGH CVE
+       (Vanta's `packageIdentifier` + `name`, severity, before → after version), the test and
+       image-scan result, and the PR URL; then
+       `linear-ticket create <project> --kind fix --severity <highest> --title "<project>: fix <N> Critical/High vulnerabilities (PR #<n>)" --body-file <f>`,
+       `linear-ticket link <ISSUE> <pr-url> --title "Fix PR"`, and
+       `vuln-ledger <project> add-ticket <ISSUE> --kind fix --cves <every CVE in the PR> --url <url> --pr <pr-url>`.
+     Put the ticket in the Slack line: `… Ready for your review. Ticket <url|EMB-123>.`
+     Never close a fix ticket yourself — the batch runner closes it when the PR merges.
 
    - **A fix broke something** (tests regressed vs baseline, or the image fails to build
      or still shows the CVE): **do NOT open a PR.** Leave the base branch untouched. Slack:
@@ -294,6 +374,8 @@ runs before (processes vanish with no summary). So:
       "cves_fixed": [],
       "cves_unfixable": [],
       "cves_already_fixed_in_base": [],
+      "cves_deactivated": [],
+      "tickets": [],
       "pr_url": null,
       "base_branch": null,
       "tests": "green | red | pre-existing-red | skipped | incomplete",
@@ -308,8 +390,10 @@ runs before (processes vanish with no summary). So:
     message you needed to send was delivered; `false` — a message was needed and could
     not be delivered, which is exactly the signal this block exists to carry, so never
     round it up to true; `null` — no message was needed this run (e.g. nothing-to-do).
-    When `outcome` is `fixed`, `pr_url` and `cves_fixed` must both be filled in. The server
-    checks this contract and flags a summary that breaks it.
+    When `outcome` is `fixed`, `pr_url` and `cves_fixed` must both be filled in.
+    `cves_deactivated` lists every CVE you deactivated in Vanta this run; `tickets` lists
+    every Linear issue id you created, linked, commented on or extended (`["EMB-123"]`).
+    The server checks this contract and flags a summary that breaks it.
 
 
 ## Rules
@@ -336,7 +420,7 @@ runs before (processes vanish with no summary). So:
 - **Never describe PR contents before a PR exists.** Do not say a fix is "in" or "not in
   the PR" until you have actually run `gh pr create` and have a real PR URL. A finding you
   could not fix (unfixable, or a net regression per step 7) is reported as an action item —
-  "deactivate in Vanta / review manually" — never as a claim about a PR. Reference a PR only
+  "deactivated in Vanta, ticket <id>" or "review manually" — never as a claim about a PR. Reference a PR only
   by the real URL `gh pr create` returned; if you opened none, say "no PR opened," not
   "not in the PR."
 - Distinguish "fixed and MERGED in <base>" (truly done, only the image rebuild is pending)

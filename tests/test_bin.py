@@ -136,6 +136,64 @@ def test_slack_unconfigured_is_exit_4():
     print("slack-notify reports unconfigured as exit 4")
 
 
+def test_ledger_tickets():
+    """The ledger is what stops a nightly run opening a second ticket for the same CVE,
+    and what tells the runner an exception review is due."""
+    assert run("vuln-ledger", "t1", "add-ticket", "EMB-1", "--kind", "exception",
+               "--cves", "CVE-1,CVE-2", "--review-date", "2020-01-01",
+               "--vanta", "indefinite").returncode == 0
+    r = run("vuln-ledger", "t1", "ticket-for", "CVE-2")
+    assert r.returncode == 0 and json.loads(r.stdout)["issue"] == "EMB-1", r
+    assert run("vuln-ledger", "t1", "ticket-for", "CVE-3").returncode == 1
+
+    due = json.loads(run("vuln-ledger", "t1", "tickets", "--due").stdout)
+    assert [t["issue"] for t in due] == ["EMB-1"], due
+
+    # Its fix ships: the same ticket becomes a fix ticket and is no longer a due review.
+    run("vuln-ledger", "t1", "add-ticket", "EMB-1", "--kind", "fix", "--cves", "CVE-3",
+        "--pr", "https://example/pull/2")
+    t = json.loads(run("vuln-ledger", "t1", "ticket-for", "CVE-1").stdout)
+    assert t["kind"] == "fix" and t["cves"] == ["CVE-1", "CVE-2", "CVE-3"], t
+    assert t["vanta"] == "indefinite" and t["pr"] == "https://example/pull/2", t
+    assert json.loads(run("vuln-ledger", "t1", "tickets", "--due").stdout) == []
+
+    assert run("vuln-ledger", "t1", "close-ticket", "EMB-1").returncode == 0
+    assert run("vuln-ledger", "t1", "ticket-for", "CVE-1").returncode == 1, "closed"
+    assert json.loads(run("vuln-ledger", "t1", "tickets", "--open").stdout) == []
+    assert len(json.loads(run("vuln-ledger", "t1", "tickets").stdout)) == 1
+
+    for bad in (["add-ticket", "EMB-2", "--kind", "nope", "--cves", "C"],
+                ["add-ticket", "EMB-2", "--kind", "fix"],
+                ["add-ticket", "EMB-2", "--kind", "fix", "--cves", "C", "--review-date", "soon"],
+                ["close-ticket"], ["ticket-for"]):
+        r = run("vuln-ledger", "t1", *bad)
+        assert r.returncode == 2 and "Traceback" not in r.stderr, (bad, r)
+    print("ledger tracks tickets: dedupe by CVE, due reviews, exception -> fix, close")
+
+
+def test_linear_unconfigured_is_exit_4():
+    """Like slack-notify: 'could not file the ticket' must be distinguishable."""
+    env = dict(LINEAR_API_KEY="", LINEAR_TEAM_ID="", LINEAR_PROJECT_ID="")
+    r = run("linear-ticket", "close", "EMB-1", **env)
+    assert r.returncode == 4 and "not configured" in r.stderr, r
+    r = run("linear-ticket", "nonsense", **env)
+    assert r.returncode == 1 and "usage" in r.stderr, r
+    print("linear-ticket reports unconfigured as exit 4")
+
+
+def test_vanta_deactivate_usage():
+    """A deactivation without a reason must never reach Vanta — the reason is what the
+    auditor reads."""
+    reg = pathlib.Path(__file__).resolve().parent.parent / "app" / "projects.json"
+    name = next(k for k, v in json.loads(reg.read_text()).items() if isinstance(v, dict))
+    r = run("vanta-findings", name, "deactivate", "CVE-1")
+    assert r.returncode == 1 and "usage" in r.stderr, r
+    r = run("vanta-findings", "definitely-not-a-project", "deactivate", "CVE-1",
+            "--reason", "x")
+    assert r.returncode == 3, r
+    print("vanta-findings deactivate requires a reason and a registered project")
+
+
 def write_run(name, **summary):
     runs = pathlib.Path(STATE, "runs")
     runs.mkdir(exist_ok=True)
@@ -211,6 +269,9 @@ if __name__ == "__main__":
     test_resolved_clears_notified()
     test_vanta_unknown_project()
     test_slack_unconfigured_is_exit_4()
+    test_ledger_tickets()
+    test_linear_unconfigured_is_exit_4()
+    test_vanta_deactivate_usage()
     test_report_counts_unique_cves_and_flags_problems()
     test_report_usage_errors()
     print("ok")

@@ -32,6 +32,12 @@ services:
       SSH_KEY_PASSPHRASE: ${SSH_KEY_PASSPHRASE:-}
       VANTA_CLIENT_ID: ${VANTA_CLIENT_ID:-}
       VANTA_CLIENT_SECRET: ${VANTA_CLIENT_SECRET:-}
+      # Compliance tickets (bin/linear-ticket): one per fix PR, one per Vanta exception.
+      LINEAR_API_KEY: ${LINEAR_API_KEY:-}
+      LINEAR_TEAM_ID: ${LINEAR_TEAM_ID:-}
+      LINEAR_PROJECT_ID: ${LINEAR_PROJECT_ID:-}
+      # How long a Vanta exception lasts and when its Linear ticket is due for review.
+      EXCEPTION_REVIEW_DAYS: ${EXCEPTION_REVIEW_DAYS:-30}
       SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
       SLACK_CHANNEL: ${SLACK_CHANNEL:-#development-and-pr-reviews}
     volumes:
