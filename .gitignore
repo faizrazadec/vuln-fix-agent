@@ -17,3 +17,7 @@ projects.json
 
 # Logs
 *.log
+
+# Local agent notes — deployment state and working notes, kept out of the public repo
+AGENTS.md
+CLAUDE.md
