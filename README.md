@@ -97,8 +97,10 @@ assigned to the system owner, and every exception has a remediation plan and rev
 | Vanta lists a fix that cannot be applied (vendored binary, net regression) | Deactivated with no end date, since Vanta would otherwise keep re-raising it | Same, and the ticket's due date is the only review trigger |
 | Fix PR touches a Critical/High finding | Nothing to do | One ticket linked to the PR, or the existing exception ticket reused |
 
-`scripts/VulnFixAgent` closes a ticket when its PR merges (`linear-ticket sync`), because
-Linear's GitHub integration is not assumed. It also starts a run when an exception's
+The agent writes a `Fixes <ID>` line for each ticket into the PR description, so Linear's
+GitHub integration closes the ticket when the PR merges. `scripts/VulnFixAgent` runs
+`linear-ticket sync` every night as a backup, for repos whose GitHub org is not linked to
+the Linear workspace. The runner also starts a run when an exception's
 review date arrives, even if Vanta shows no open findings. A deactivated finding does not
 appear in `vanta-findings`, so the review date is what brings it back. A review that finds
 no fix extends the deactivation and the due date by another 30 days.
