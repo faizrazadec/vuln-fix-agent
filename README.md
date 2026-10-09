@@ -7,7 +7,7 @@ findings from Vanta, patches the repo, rebuilds and scans the image, runs the te
 opens a signed pull request. It waits for the PR's GitHub checks, fixes what fails, and only
 then reports the result to Slack. Findings with no reachable fix
 are deactivated in Vanta as time-boxed exceptions, and every exception and every
-Critical/High fix PR is tracked in a Linear ticket assigned to the project owner.
+fix PR, whatever its severity, is tracked in a Linear ticket assigned to the project owner.
 
 A cron job runs every registered project on weekday nights, one at a time.
 
@@ -90,12 +90,13 @@ docker compose exec -u agent vuln-fix-agent vanta-findings --check-registry
 
 Two ISO controls drive this: every risk-relevant Critical/High vulnerability has a ticket
 assigned to the system owner, and every exception has a remediation plan and review date.
+The agent goes further than the first: every fix PR gets a ticket, Medium/Low-only ones included.
 
 | Situation | Vanta | Linear |
 |---|---|---|
 | No fix exists | Deactivated for `EXCEPTION_REVIEW_DAYS` (30); lifts early when Vanta sees a fix | Backlog ticket per package: CVEs, reason, risk treatment, due on the review date |
 | Vanta lists a fix that cannot be applied (vendored binary, net regression) | Deactivated with no end date, since Vanta would otherwise keep re-raising it | Same, and the ticket's due date is the only review trigger |
-| Fix PR touches a Critical/High finding | Nothing to do | One ticket linked to the PR, or the existing exception ticket reused |
+| Fix PR opened (any severity) | Nothing to do | One ticket linked to the PR, or the existing exception ticket reused |
 
 The agent writes a `Fixes <ID>` line for each ticket into the PR description, so Linear's
 GitHub integration closes the ticket when the PR merges. `scripts/VulnFixAgent` runs
