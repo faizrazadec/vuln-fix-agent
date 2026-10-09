@@ -171,6 +171,13 @@ def test_ledger_tickets():
     print("ledger tracks tickets: dedupe by CVE, due reviews, exception -> fix, close")
 
 
+def test_vanta_untracked_needs_registered_project():
+    """--untracked reads the ledger, but only after the registry check."""
+    r = run("vanta-findings", "definitely-not-a-project", "--json", "--untracked")
+    assert r.returncode == 3 and "not a registered project" in r.stderr, r
+    print("vanta-findings --untracked rejects an unregistered project")
+
+
 def test_linear_unconfigured_is_exit_4():
     """Like slack-notify: 'could not file the ticket' must be distinguishable."""
     env = dict(LINEAR_API_KEY="", LINEAR_TEAM_ID="", LINEAR_PROJECT_ID="")
@@ -270,6 +277,7 @@ if __name__ == "__main__":
     test_vanta_unknown_project()
     test_slack_unconfigured_is_exit_4()
     test_ledger_tickets()
+    test_vanta_untracked_needs_registered_project()
     test_linear_unconfigured_is_exit_4()
     test_vanta_deactivate_usage()
     test_report_counts_unique_cves_and_flags_problems()
