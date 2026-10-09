@@ -103,6 +103,12 @@ appear in `vanta-findings`, so the review date is what brings it back. A review 
 no fix extends the deactivation and the due date by another 30 days.
 `linear-ticket` only edits issues in `LINEAR_PROJECT_ID`.
 
+Deactivating and ticketing are separate steps, so an interrupted run can leave an
+exception with no ticket, and exceptions made by hand in Vanta never had one.
+`vanta-findings <project> --json --untracked` lists deactivated findings that no open
+ticket covers. The runner starts a session when that list is not empty, and the agent
+files the missing tickets without changing the Vanta exception itself.
+
 ## Usage
 
 ```bash

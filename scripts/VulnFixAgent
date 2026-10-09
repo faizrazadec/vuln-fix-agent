@@ -136,6 +136,12 @@ for proj in $PROJECTS; do
 try: print(len(json.load(sys.stdin)))
 except Exception: print(0)' 2>/dev/null)
 
+  # Deactivated in Vanta but tracked by no open ticket: a run cut off between deactivating
+  # and ticketing, or an exception someone made by hand. Also invisible to the count below.
+  UNTRACKED=$(inside vanta-findings "$proj" --json --untracked 2>/dev/null | python3 -c 'import json,sys
+try: print(len(json.load(sys.stdin)))
+except Exception: print(0)' 2>/dev/null)
+
   # --- pre-filter -----------------------------------------------------------------
   # Most projects have no open findings on most days, and the agent's only way to learn
   # that was to spawn a full Claude Code session (~60s and real quota) to shell out to
@@ -154,8 +160,8 @@ except Exception: print(0)' 2>/dev/null)
     N=$(printf '%s' "$FINDINGS" | python3 -c 'import json,sys
 try: print(len(json.load(sys.stdin)))
 except Exception: print(-1)' 2>/dev/null)
-    if [ "$N" = 0 ] && [ "${DUE:-0}" -gt 0 ]; then
-      say "--- $proj: no open findings, but $DUE exception review(s) due — dispatching"
+    if [ "$N" = 0 ] && { [ "${DUE:-0}" -gt 0 ] || [ "${UNTRACKED:-0}" -gt 0 ]; }; then
+      say "--- $proj: no open findings, but ${DUE:-0} review(s) due and ${UNTRACKED:-0} untracked exception(s) — dispatching"
     elif [ "$N" = 0 ]; then
       say "--- $proj: no open findings — skipped (no session spawned)"
       skipped=$((skipped + 1)); continue

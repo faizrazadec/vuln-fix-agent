@@ -3,7 +3,8 @@
 
     vanta-findings snapdev-backend            # human-readable
     vanta-findings snapdev-backend --json     # machine-readable, for the agent
-    vanta-findings snapdev-backend --json --deactivated   # findings WE have deactivated
+    vanta-findings snapdev-backend --json --deactivated   # findings that are deactivated
+    vanta-findings snapdev-backend --json --untracked     # deactivated, but no open ticket
     vanta-findings --check-registry           # do every project's assets resolve in Vanta?
     vanta-findings snapdev-backend deactivate <CVE> --reason "..." [--indefinite]
 
@@ -34,6 +35,7 @@ import datetime
 import json
 import os
 import pathlib
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -252,10 +254,28 @@ def collect(token, cfg, deactivated=False):
     return found
 
 
+def untracked(name, found):
+    """Deactivated records whose CVE no open ticket in the ledger covers.
+
+    Deactivating and ticketing are two steps, so a run cut off between them (a crash, the
+    usage limit) leaves an exception nobody tracks — and deactivations made by hand in
+    Vanta never had a ticket at all. This is what finds both.
+    """
+    r = subprocess.run([str(pathlib.Path(__file__).with_name("vuln-ledger")), name,
+                        "tickets", "--open"], capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"could not read the ledger: {r.stderr.strip()}", 4)
+    covered = {c for t in json.loads(r.stdout) for c in t.get("cves") or []}
+    return [v for v in found if cve_of(v) not in covered]
+
+
+def cve_of(v):
+    return (v.get("name") or "").split(" - ")[0].strip()
+
+
 def matches(v, cve):
     """Vanta names a GHSA record "GHSA-xxxx - next", a CVE record just "CVE-…"."""
-    n = (v.get("name") or "").strip()
-    return v.get("id") == cve or n == cve or n.split(" - ")[0].strip() == cve
+    return v.get("id") == cve or (v.get("name") or "").strip() == cve or cve_of(v) == cve
 
 
 def deactivate(name, cfg, rest):
@@ -340,7 +360,10 @@ def main():
         sys.exit(deactivate(name, cfg, sys.argv[sys.argv.index("deactivate") + 1:]))
 
     token = get_token()
-    found = collect(token, cfg, deactivated="--deactivated" in sys.argv)
+    found = collect(token, cfg,
+                    deactivated="--deactivated" in sys.argv or "--untracked" in sys.argv)
+    if "--untracked" in sys.argv:
+        found = untracked(name, found)
 
     if as_json:
         print(json.dumps(found, indent=2))

@@ -120,6 +120,26 @@ create (non-zero exit) is a failure to report, never something to paper over.
         `vuln-ledger <project> add-ticket <ISSUE> --kind exception --cves <CVEs> --review-date <same date>`.
         No Slack message for a routine extension — the ticket comment is the record.
 
+   e. **Exceptions with no ticket** — `vanta-findings <project> --json --untracked` lists
+      records that are deactivated in Vanta but covered by no open ticket. Two causes,
+      both must end with a ticket: a previous run deactivated them and was cut off before
+      ticketing (a crash, the usage limit), or someone deactivated them by hand in Vanta
+      before tickets existed. Each record's `deactivateMetadata` says who, when, why and
+      until when (`deactivatedUntilDate` null = indefinite). Do NOT re-deactivate or
+      reactivate them — the exception already exists; it only lacks its ticket. For each
+      package, first re-check reachability as in 6a:
+      - **A fix is now reachable** → it is live work: fix it in this run (6b), and in step 8
+        create the fix ticket as usual — that ticket covers these CVEs too.
+      - **Still no reachable fix** → one exception ticket per package, exactly as in 6a
+        (`linear-ticket create … --kind exception`, body with every CVE, reason, risk
+        treatment, review date). In the body, say how it was deactivated — quote
+        `deactivationReason` and the date, and whether it has an end date in Vanta. For an
+        indefinite deactivation made by hand, say so plainly: it is the gap the ISO review
+        flagged, and the ticket's due date is now its only review. Then
+        `vuln-ledger <project> add-ticket <ISSUE> --kind exception --cves <CVEs> --url <url> --review-date <due> --vanta <until|indefinite per deactivatedUntilDate>`.
+      Include them in the deactivation Slack message under "already deactivated, now
+      ticketed", but do not list them in `cves_deactivated` — you did not deactivate them.
+
    Only findings that survive triage — genuinely new, fixable, no open PR — go on to the
    work below. If nothing survives, skip straight to the report: clone was cheap, and you
    just saved a full remediation cycle.
@@ -380,13 +400,14 @@ create (non-zero exit) is a failure to report, never something to paper over.
       "base_branch": null,
       "tests": "green | red | pre-existing-red | skipped | incomplete",
       "image_scan": "green | red | skipped | no-dockerfile",
-      "slack_notified": "true | false | null",
+      "slack_notified": true,
       "clone_kept": null,
       "notes": "one line, anything a human should know"
     }
     ```
 
-    Report it as it actually happened. `slack_notified` has three values: `true` — every
+    Report it as it actually happened. `slack_notified` is a JSON boolean or null, never a
+    string (`true`, not `"true"`), with three meanings: `true` — every
     message you needed to send was delivered; `false` — a message was needed and could
     not be delivered, which is exactly the signal this block exists to carry, so never
     round it up to true; `null` — no message was needed this run (e.g. nothing-to-do).
