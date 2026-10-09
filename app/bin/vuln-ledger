@@ -21,6 +21,7 @@ from git and gh at run time (nothing to keep in sync). This ledger records only:
     vuln-ledger <project> tickets [--open] [--due]     # JSON list; --due = exception
                                                        # tickets whose review date has come
     vuln-ledger <project> close-ticket <ISSUE>
+    vuln-ledger --help                                 # this text; reads and writes nothing
 
 `notified` is a suppression check, and suppression that never lifts is a bug: a CVE
 recorded as unfixable stays suppressed even after upstream ships a patch. So pass
@@ -34,7 +35,9 @@ add-notified and notified. The suppression lifts — exit 1, notify again — wh
 
 Stored under $STATE_DIR (a persisted volume), one file per project.
 
-Exit codes: 0 / 1 as described for `notified`; 2 usage error; 3 bad project name.
+Exit codes: 0 / 1 as described for `notified`; 2 usage error (including an unknown
+option, or a positional argument starting with `-` — a flag never becomes a ledger key);
+3 bad project name.
 """
 
 import datetime
@@ -138,6 +141,10 @@ def opt(args, name):
 
 
 def main():
+    if any(a in ("-h", "--help") for a in sys.argv[1:]):
+        # A help probe must never have side effects — checked before argv means anything.
+        print(__doc__.strip())
+        sys.exit(0)
     argv = sys.argv[1:]
     fixed_version = clean_version(opt(argv, "--fixed-version"))
     reason = opt(argv, "--reason")
@@ -150,6 +157,11 @@ def main():
     only_open = "--open" in argv
     only_due = "--due" in argv
     argv = [a for a in argv if a not in ("--open", "--due")]
+    # Every known option is consumed above, so anything still starting with "-" is an
+    # unknown flag — it must not be taken as a CVE or issue id and written as a key.
+    bad = [a for a in argv if a.startswith("-")]
+    if bad:
+        die(f"unknown option {bad[0]!r} (see vuln-ledger --help)")
 
     if not argv:
         die("usage: vuln-ledger <project> [notified|add-notified|add-resolved] ...")

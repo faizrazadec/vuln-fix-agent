@@ -6,6 +6,7 @@
     vuln-report --since 2026-09-01
     vuln-report --project alkaline3
     vuln-report --json               # the same numbers, machine-readable
+    vuln-report --help               # this text
 
 The server writes one file per run (see _save_run_summary in main.py): the agent's own
 JSON block, plus a `run` object with turns, duration and API-equivalent cost that the
@@ -187,6 +188,10 @@ def print_table(per, since, unreadable):
 
 
 def main():
+    if any(a in ("-h", "--help") for a in sys.argv[1:]):
+        # A help probe must never have side effects — checked before argv means anything.
+        print(__doc__.strip())
+        sys.exit(0)
     argv = sys.argv[1:]
     want_json = "--json" in argv
     if want_json:
