@@ -27,6 +27,14 @@ say() { echo "$(LOG_TS) $*"; }
 inside() { docker compose exec -T -u agent "$SVC" "$@"; }
 
 SKIP_EMPTY=1
+# Vanta pre-check retries. A single DNS blip used to abort the whole batch. Three quick
+# tries VANTA_RETRY_DELAY apart, then the wait doubles each time, up to VANTA_RETRY_CAP,
+# for VANTA_RETRY_MAX tries in all (defaults: 30s, 30s, then 1, 2, 4, 8, 16 min — ~32 min)
+# before Vanta counts as really down. Override them in the environment (e.g. the crontab
+# line); this script does not read .env.
+VANTA_RETRY_MAX=${VANTA_RETRY_MAX:-8}
+VANTA_RETRY_DELAY=${VANTA_RETRY_DELAY:-30}
+VANTA_RETRY_CAP=${VANTA_RETRY_CAP:-960}
 ARGS=()
 for a in "$@"; do
   case "$a" in
@@ -67,6 +75,31 @@ if ! curl -sf -m 10 -o /dev/null "$CARD"; then
   say "agent not reachable at $CARD — is the $SVC container up? aborting"
   exit 1
 fi
+
+# --- Vanta pre-check, with retries -----------------------------------------------
+# Sets FINDINGS, rc and VANTA_ERR (the tool's own stderr, which used to be thrown away,
+# so a failure could not be diagnosed after the fact). Only exit 2 — auth or network —
+# is retried; any other code is a per-project answer and retrying cannot change it.
+vanta_check() {
+  local attempt=1 delay errf
+  errf=$(mktemp)
+  while :; do
+    FINDINGS=$(inside vanta-findings "$1" --json 2>"$errf")
+    rc=$?
+    VANTA_ERR=$(grep -v '^owners:' "$errf" | tail -n 2 | tr '\n' ' ')
+    [ "$rc" = 2 ] && [ "$attempt" -lt "$VANTA_RETRY_MAX" ] || break
+    if [ "$attempt" -lt 3 ]; then
+      delay=$VANTA_RETRY_DELAY
+    else
+      delay=$(( VANTA_RETRY_DELAY << (attempt - 2) ))
+      [ "$delay" -gt "$VANTA_RETRY_CAP" ] && delay=$VANTA_RETRY_CAP
+    fi
+    say "--- $1: Vanta check failed (try $attempt/$VANTA_RETRY_MAX): ${VANTA_ERR:-no error text} — retrying in ${delay}s"
+    sleep "$delay"
+    attempt=$((attempt + 1))
+  done
+  rm -f "$errf"
+}
 
 # --- reaper ---------------------------------------------------------------------
 # Cleanup used to live only in SKILL.md, i.e. it happened when the agent remembered to
@@ -147,14 +180,15 @@ except Exception: print(0)' 2>/dev/null)
   # that was to spawn a full Claude Code session (~60s and real quota) to shell out to
   # vanta-findings. Ask here instead, and dispatch a session only when there is work.
   if [ "$SKIP_EMPTY" = 1 ]; then
-    FINDINGS=$(inside vanta-findings "$proj" --json 2>/dev/null)
-    rc=$?
+    vanta_check "$proj"
     if [ "$rc" = 2 ]; then
-      # Auth or network: every remaining project would fail the same way.
-      say "!!! Vanta is unreachable or rejecting our credentials — aborting the batch"
+      # Still failing after every retry: auth or a real outage, and every remaining
+      # project would fail the same way.
+      say "!!! Vanta is unreachable or rejecting our credentials after $VANTA_RETRY_MAX tries — aborting the batch"
+      say "!!! last error: ${VANTA_ERR:-none captured}"
       exit 1
     elif [ "$rc" != 0 ]; then
-      say "--- $proj: vanta-findings failed (exit $rc) — skipping, see \`vanta-findings --check-registry\`"
+      say "--- $proj: vanta-findings failed (exit $rc): ${VANTA_ERR:-no error text} — skipping, see \`vanta-findings --check-registry\`"
       errored=$((errored + 1)); continue
     fi
     N=$(printf '%s' "$FINDINGS" | python3 -c 'import json,sys
