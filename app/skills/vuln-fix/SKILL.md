@@ -17,6 +17,9 @@ EVERY message to this channel — each one is an action item for them (review a 
 an exception you made in Vanta, or investigate a broken fix). Keep every message to 1–3 lines.
 `slack-notify` prints `sent` and exits 0 on delivery; any other exit means the message was
 not delivered — say so in your final report and never assume it was sent.
+Every CLI here (`slack-notify`, `vuln-ledger`, `vanta-findings`, `linear-ticket`,
+`vuln-report`) documents itself with `--help`, which is side-effect free — use that to
+probe one, never a guessed flag.
 
 **Resource discipline — applies to every test run and image build below.** This runs on a
 memory-constrained VM shared with other work; unbounded parallelism has OOM-killed test

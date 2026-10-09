@@ -3,13 +3,20 @@
 
     slack-notify "text"                 # posts to the default channel
     echo "text" | slack-notify          # same, from stdin
+    slack-notify --help                 # this text; sends nothing
 
 Prefers an Incoming Webhook (SLACK_WEBHOOK_URL) — one URL bound to one channel, no
 scopes or bot invites. Falls back to a bot token (SLACK_BOT_TOKEN + SLACK_CHANNEL)
 if you'd rather use chat.postMessage.
 
-Exit 0 on success. Exit 4 if nothing is configured — the agent must treat that as
-"could not notify" and say so, not assume the message was delivered.
+There are no options. A first argument starting with `-` is refused as a usage error
+rather than posted, so a mistyped flag (`--channel x`) never reaches the channel. Dashes
+later in the text are fine.
+
+Exit 0 on success (prints `sent`). Exit 2 Slack refused or could not be reached. Exit 4
+if nothing is configured — the agent must treat that as "could not notify" and say so,
+not assume the message was delivered. Exit 64 usage error (no text, or a leading `-`);
+nothing was sent.
 """
 
 import json
@@ -28,10 +35,20 @@ def die(msg, code=1):
     sys.exit(code)
 
 
+USAGE = "usage: slack-notify \"message\"  (or pipe text on stdin; --help for more)"
+
+
 def main():
-    text = " ".join(sys.argv[1:]).strip() or sys.stdin.read().strip()
+    if any(a in ("-h", "--help") for a in sys.argv[1:]):
+        # A help probe must never have side effects — checked before argv means anything.
+        print(__doc__.strip())
+        sys.exit(0)
+    argv = sys.argv[1:]
+    if argv and argv[0].startswith("-"):
+        die(f"slack-notify takes no options, refusing to post {argv[0]!r}\n{USAGE}", 64)
+    text = " ".join(argv).strip() or sys.stdin.read().strip()
     if not text:
-        die("usage: slack-notify \"message\"  (or pipe text on stdin)")
+        die(USAGE, 64)
 
     if WEBHOOK:
         req = urllib.request.Request(

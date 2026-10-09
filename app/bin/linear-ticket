@@ -8,6 +8,8 @@
     linear-ticket due <ISSUE> YYYY-MM-DD                  # move the review date
     linear-ticket close <ISSUE> ["comment"]
     linear-ticket sync <project>                          # close tickets whose PR merged
+    linear-ticket --help                                  # this text, also after any command;
+                                                          # never calls Linear
 
 `create` assigns the project's first owner (by the `linear_id` in projects.json) and
 subscribes the rest. A fix ticket starts in review, since its PR already exists; an
@@ -23,7 +25,10 @@ merged usually has no findings left and would never get a session to notice.
 Every command that touches an existing issue first checks that it belongs to
 LINEAR_PROJECT_ID, so the agent cannot edit tickets outside the register.
 
-Exit codes: 0 ok; 2 API/network; 3 unknown project, owner without linear_id, or an issue
+Any other argument starting with `-` is refused as a usage error, so a mistyped flag is
+never posted as a comment or taken as an issue id.
+
+Exit codes: 0 ok; 1 usage error; 2 API/network; 3 unknown project, owner without linear_id, or an issue
 outside the register; 4 not configured.
 """
 
@@ -254,12 +259,25 @@ def cmd_sync(args):
     print(f"sync {args[0]}: {closed} closed, {reopened} PR(s) closed unmerged")
 
 
+OPTIONS = ("--kind", "--title", "--severity", "--body-file", "--due")  # all take a value
+
+
 def main():
+    if any(a in ("-h", "--help") for a in sys.argv[1:]):
+        # A help probe must never have side effects — checked before argv means anything.
+        print(__doc__.strip())
+        sys.exit(0)
     argv = sys.argv[1:]
     cmds = {"create": cmd_create, "link": cmd_link, "comment": cmd_comment,
             "due": cmd_due, "close": cmd_close, "sync": cmd_sync}
     if not argv or argv[0] not in cmds:
-        die(f"usage: linear-ticket {{{'|'.join(cmds)}}} ...")
+        die(f"usage: linear-ticket {{{'|'.join(cmds)}}} ...  (--help for more)")
+    rest = iter(argv[1:])
+    for a in rest:
+        if a in OPTIONS:
+            next(rest, None)  # its value may legitimately start with "-"
+        elif a.startswith("-"):
+            die(f"unknown option {a!r} (see linear-ticket --help)")
     cmds[argv[0]](argv[1:])
 
 

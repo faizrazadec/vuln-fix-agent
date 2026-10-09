@@ -267,6 +267,96 @@ def test_report_usage_errors():
     print("vuln-report usage errors are exit 2; no runs dir is not an error")
 
 
+# A delivery attempt to this would fail (exit 2), so exit 0 proves nothing was sent.
+DEAD_WEBHOOK = dict(SLACK_WEBHOOK_URL="http://127.0.0.1:9/", SLACK_BOT_TOKEN="")
+NO_CREDS = dict(VANTA_CLIENT_ID="", VANTA_CLIENT_SECRET="", LINEAR_API_KEY="",
+                LINEAR_TEAM_ID="", LINEAR_PROJECT_ID="", **DEAD_WEBHOOK)
+
+
+def test_slack_help_and_flags_never_post():
+    """`slack-notify --help` used to post the literal text "--help" to the channel."""
+    for args in (["--help"], ["-h"], ["hello", "--help"]):
+        r = run("slack-notify", *args, **DEAD_WEBHOOK)
+        assert r.returncode == 0, (args, r)
+        assert "usage" in r.stdout.lower() or "slack-notify" in r.stdout, r.stdout
+        assert "sent" not in r.stdout.split(), r.stdout
+    for args in (["--channel", "x"], ["-v"], ["--"]):
+        r = run("slack-notify", *args, **DEAD_WEBHOOK)
+        assert r.returncode == 64 and "usage" in r.stderr, (args, r)
+        assert "could not reach" not in r.stderr, "a delivery was attempted"
+    # Usage errors are not "not configured": 4 keeps its meaning.
+    r = run("slack-notify", "--channel", "x", SLACK_WEBHOOK_URL="", SLACK_BOT_TOKEN="")
+    assert r.returncode == 64, r
+    # A dash mid-text is a message, not a flag: it reaches delivery (and fails there).
+    r = run("slack-notify", "PR opened - see link --fast", **DEAD_WEBHOOK)
+    assert r.returncode == 2 and "could not reach Slack" in r.stderr, r
+    r = subprocess.run([sys.executable, str(BIN / "slack-notify")], input="- from stdin\n",
+                       capture_output=True, text=True,
+                       env={**os.environ, "STATE_DIR": STATE, **DEAD_WEBHOOK})
+    assert r.returncode == 2 and "could not reach Slack" in r.stderr, r
+    print("slack-notify: --help prints usage and sends nothing; leading flags are exit 64")
+
+
+def test_ledger_help_and_flags_never_write():
+    """`add-notified --help` used to record a ledger key named "--help"."""
+    f = pathlib.Path(STATE, "helpproj.json")
+    for args in (["--help"], ["helpproj", "--help"], ["helpproj", "add-notified", "--help"],
+                 ["helpproj", "add-ticket", "-h", "--kind", "fix", "--cves", "C"]):
+        r = run("vuln-ledger", *args)
+        assert r.returncode == 0 and "vuln-ledger <project>" in r.stdout, (args, r)
+    assert not f.exists(), f.read_text()
+
+    for args in (["add-notified", "-x"], ["add-notified", "--fixed", "1.0"],
+                 ["add-resolved", "-x", "https://example/pull/1"],
+                 ["add-ticket", "-x", "--kind", "fix", "--cves", "C"],
+                 ["close-ticket", "--bogus"]):
+        r = run("vuln-ledger", "helpproj", *args)
+        assert r.returncode == 2 and "unknown option" in r.stderr, (args, r)
+    assert not f.exists(), f.read_text()
+
+    # Option values may still start with "-": "-" is one of Vanta's "no patch" spellings.
+    r = run("vuln-ledger", "helpproj", "add-notified", "CVE-5", "--fixed-version", "-",
+            "--reason", "-- vendored")
+    assert r.returncode == 0, r
+    assert list(json.loads(f.read_text())["notified"]) == ["CVE-5"]
+    print("vuln-ledger: --help writes nothing; a flag is never taken as a CVE")
+
+
+def test_vanta_help_never_calls_vanta():
+    reg = pathlib.Path(__file__).resolve().parent.parent / "app" / "projects.json"
+    name = next(k for k, v in json.loads(reg.read_text()).items() if isinstance(v, dict))
+    # Pointed at a dead endpoint with credentials set: any API call would exit 2.
+    env = dict(VANTA_CLIENT_ID="x", VANTA_CLIENT_SECRET="x", VANTA_API_BASE="http://127.0.0.1:9")
+    for args in (["--help"], ["-h"], [name, "--json", "--help"],
+                 [name, "deactivate", "--help"],
+                 [name, "deactivate", "CVE-1", "--reason", "x", "--help"]):
+        r = run("vanta-findings", *args, **env)
+        assert r.returncode == 0 and "vanta-findings" in r.stdout, (args, r)
+        assert "deactivated" not in r.stdout.splitlines()[-1], r.stdout
+    r = run("vanta-findings", name, "deactivate", "-x", "--reason", "x", **env)
+    assert r.returncode == 1 and "not a CVE" in r.stderr, r
+    print("vanta-findings: --help (also after deactivate) never contacts Vanta")
+
+
+def test_linear_and_report_help():
+    for args in (["--help"], ["-h"], ["create", "--help"], ["comment", "EMB-1", "--help"],
+                 ["close", "EMB-1", "-h"]):
+        r = run("linear-ticket", *args, **NO_CREDS)
+        assert r.returncode == 0 and "linear-ticket create" in r.stdout, (args, r)
+    # Configured but dead endpoint: a usage error must come back before any call (exit 2).
+    env = dict(LINEAR_API_KEY="x", LINEAR_TEAM_ID="x", LINEAR_PROJECT_ID="x",
+               LINEAR_API_URL="http://127.0.0.1:9/")
+    for args in (["comment", "EMB-1", "--bogus"], ["close", "-x"],
+                 ["create", "p", "--kind", "fix", "--verbose"]):
+        r = run("linear-ticket", *args, **env)
+        assert r.returncode == 1 and "unknown option" in r.stderr, (args, r)
+
+    for args in (["--help"], ["-h"], ["--days", "3", "--help"]):
+        r = run("vuln-report", *args)
+        assert r.returncode == 0 and "vuln-report --days" in r.stdout, (args, r)
+    print("linear-ticket and vuln-report: --help prints usage, no API call")
+
+
 if __name__ == "__main__":
     test_ledger_usage_errors()
     test_ledger_tolerates_partial_state_file()
@@ -282,4 +372,8 @@ if __name__ == "__main__":
     test_vanta_deactivate_usage()
     test_report_counts_unique_cves_and_flags_problems()
     test_report_usage_errors()
+    test_slack_help_and_flags_never_post()
+    test_ledger_help_and_flags_never_write()
+    test_vanta_help_never_calls_vanta()
+    test_linear_and_report_help()
     print("ok")

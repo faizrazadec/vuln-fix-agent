@@ -7,6 +7,7 @@
     vanta-findings snapdev-backend --json --untracked     # deactivated, but no open ticket
     vanta-findings --check-registry           # do every project's assets resolve in Vanta?
     vanta-findings snapdev-backend deactivate <CVE> --reason "..." [--indefinite]
+    vanta-findings --help                     # this text; never contacts Vanta
 
 `deactivate` marks every record of that CVE in the project's scope as an exception in
 Vanta (one CVE is usually several records, one per image). By default the exception ends
@@ -292,6 +293,9 @@ def deactivate(name, cfg, rest):
     if len(argv) != 1 or not reason:
         die("usage: vanta-findings <project> deactivate <CVE> --reason \"...\" [--indefinite]")
     cve = argv[0]
+    if cve.startswith("-"):
+        die(f"not a CVE: {cve!r}\nusage: vanta-findings <project> deactivate <CVE> "
+            "--reason \"...\" [--indefinite]")
 
     token = get_token(write=True)
     targets = [v for v in collect(token, cfg) if matches(v, cve)]
@@ -329,6 +333,10 @@ def deactivate(name, cfg, rest):
 
 
 def main():
+    if any(a in ("-h", "--help") for a in sys.argv[1:]):
+        # A help probe must never have side effects — checked before argv means anything.
+        print(__doc__.strip())
+        sys.exit(0)
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     as_json = "--json" in sys.argv
 
