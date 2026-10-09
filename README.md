@@ -4,7 +4,8 @@ An [A2A (Agent2Agent)](https://a2a-protocol.org) server that exposes Claude Code
 agent for fixing security vulnerabilities. A caller sends a JSON-RPC `SendMessage` such as
 `fix vulns in <project>`. The server runs a real Claude Code session that pulls the project's
 findings from Vanta, patches the repo, rebuilds and scans the image, runs the test suite, and
-opens a signed pull request. It reports the result to Slack. Findings with no reachable fix
+opens a signed pull request. It waits for the PR's GitHub checks, fixes what fails, and only
+then reports the result to Slack. Findings with no reachable fix
 are deactivated in Vanta as time-boxed exceptions, and every exception and every
 Critical/High fix PR is tracked in a Linear ticket assigned to the project owner.
 
@@ -19,7 +20,7 @@ cron ──> scripts/VulnFixAgent ──> scripts/ask.sh ──JSON-RPC──> a
                                                                      │
                                                     skills/vuln-fix/SKILL.md pipeline:
                           Vanta findings → clone → triage → baseline → fix → rebuild +
-                          trivy scan + tests → PR or Vanta exception → Linear ticket
+                          trivy scan + tests → PR + CI checks or Vanta exception → Linear ticket
                           → Slack note → JSON run summary
 ```
 
