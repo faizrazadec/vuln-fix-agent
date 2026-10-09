@@ -391,7 +391,23 @@ create (non-zero exit) is a failure to report, never something to paper over.
        `linear-ticket create <project> --kind fix --severity <highest> --title "<project>: fix <N> Critical/High vulnerabilities (PR #<n>)" --body-file <f>`,
        `linear-ticket link <ISSUE> <pr-url> --title "Fix PR"`, and
        `vuln-ledger <project> add-ticket <ISSUE> --kind fix --cves <every CVE in the PR> --url <url> --pr <pr-url>`.
-     Never close a fix ticket yourself — the batch runner closes it when the PR merges.
+     - **Then put every ticket ID into the PR description**, so Linear's GitHub integration
+       closes the ticket the moment the PR merges. The `linear-ticket link` attachment alone
+       does not do this — the integration only reads the PR's branch name, title and body.
+       For each ticket this PR now carries (a new fix ticket, every reused exception or fix
+       ticket, and for an adopted PR the ledger entry whose `pr` is its URL — older PRs
+       predate this rule), the body needs a line of its own reading exactly `Fixes <ISSUE>`
+       (e.g. `Fixes EMB-123`). Read the body with
+       `gh api repos/<owner>/<repo>/pulls/<n> --jq .body`, append only the lines that are
+       missing (a blank line, then one `Fixes <ISSUE>` per line), keep everything already
+       there, write the result to a file, and
+       `gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F body=@<file>` — `-F`, not `-f`
+       (`-f` sends the literal string `@<file>`), and never `gh pr edit`. If every line is
+       already present, change nothing. No ticket (a MEDIUM/LOW-only PR with no reused
+       exception ticket) means no line.
+     Never close a fix ticket yourself. Linear closes it on merge through the `Fixes` line;
+     the batch runner's nightly `linear-ticket sync` is the backup when the integration
+     misses (e.g. the repo's GitHub org is not linked to the Linear workspace).
 
      **Then Slack, tagging the owner, with the PR's real final check state** (for an adopted
      PR, "updated PR <url> — added M vulns (now N total)" in place of "opened PR <url> — fixed

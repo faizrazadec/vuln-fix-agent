@@ -14,10 +14,11 @@ subscribes the rest. A fix ticket starts in review, since its PR already exists;
 exception ticket goes to the backlog with a due date EXCEPTION_REVIEW_DAYS (30) out
 unless --due says otherwise. Both land in LINEAR_PROJECT_ID on LINEAR_TEAM_ID.
 
-`sync` is what closes a ticket on merge — Linear's GitHub integration is not installed,
-so nothing else would. The batch runner calls it for every project before its
-pre-filter, because a project whose fix merged usually has no findings left and would
-never get a session to notice.
+`sync` is the backup that closes a ticket on merge. Normally Linear's GitHub
+integration does it, from the `Fixes <ID>` line the skill writes into the PR body;
+`sync` catches repos whose GitHub org is not linked to the Linear workspace. The batch
+runner calls it for every project before its pre-filter, because a project whose fix
+merged usually has no findings left and would never get a session to notice.
 
 Every command that touches an existing issue first checks that it belongs to
 LINEAR_PROJECT_ID, so the agent cannot edit tickets outside the register.
